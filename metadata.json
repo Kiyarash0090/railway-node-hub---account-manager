@@ -1,0 +1,6 @@
+{
+  "name": "Railway Node Hub & Account Manager",
+  "description": "Comprehensive multi-account manager for Railway nodes with live logs, real-time resource metrics, budget guard auto-shutdown, and deployment engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
