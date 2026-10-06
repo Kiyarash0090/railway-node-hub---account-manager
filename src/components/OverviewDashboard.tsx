@@ -15,7 +15,7 @@ import {
   ChevronLeft,
 } from 'lucide-react';
 import { useHub } from '../context/HubContext';
-import { TEMPLATES } from '../data/initialData';
+import { TEMPLATES } from '../constants/initialData';
 import { ServiceIcon } from './ServiceIcon';
 
 interface OverviewDashboardProps {

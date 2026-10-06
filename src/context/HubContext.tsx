@@ -9,7 +9,7 @@ import {
   MetricDataPoint,
   ServiceStatus,
 } from '../types';
-import { INITIAL_ACCOUNTS, INITIAL_LOGS, TEMPLATES } from '../data/initialData';
+import { INITIAL_ACCOUNTS, INITIAL_LOGS, TEMPLATES } from '../constants/initialData';
 import { validateRailwayToken, syncRailwayProjects, deleteRailwayProject, restartRailwayService, redeployRailwayService, stopRailwayService, deleteRailwayService, getRailwayServiceMetrics } from '../services/railwayApi';
 import { extractApiError } from '../utils/githubRepo';
 import { apiFetch as fetch } from '../services/authApi';

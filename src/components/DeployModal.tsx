@@ -17,7 +17,7 @@ import {
   Check,
 } from 'lucide-react';
 import { useHub } from '../context/HubContext';
-import { TEMPLATES } from '../data/initialData';
+import { TEMPLATES } from '../constants/initialData';
 import { normalizeGitHubRepo, extractApiError } from '../utils/githubRepo';
 import { RailwayServiceDomain } from '../types';
 import {
