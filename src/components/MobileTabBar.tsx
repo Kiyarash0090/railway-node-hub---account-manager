@@ -1,9 +1,9 @@
 import React from 'react';
-import { Layers, Activity, Terminal, BarChart3, Wallet, LucideIcon } from 'lucide-react';
+import { Layers, Activity, BarChart3, Wallet, LucideIcon } from 'lucide-react';
 import { useHub } from '../context/HubContext';
 
 interface TabItem {
-  id: 'dashboard' | 'nodes' | 'logs' | 'metrics' | 'accounts';
+  id: 'dashboard' | 'nodes' | 'metrics' | 'accounts';
   label: string;
   icon: LucideIcon;
   badge?: boolean;
@@ -15,15 +15,14 @@ export const MobileTabBar: React.FC = () => {
   const tabs: TabItem[] = [
     { id: 'dashboard', label: 'داشبورد', icon: Layers },
     { id: 'nodes', label: 'نودها', icon: Activity },
-    { id: 'logs', label: 'لاگ زنده', icon: Terminal },
     { id: 'metrics', label: 'منابع', icon: BarChart3 },
-    { id: 'accounts', label: 'اکانت‌ها', icon: Wallet, badge: accounts.some((a) => a.isShutdownTriggered) },
+    { id: 'accounts', label: 'اکانت‌ها', icon: Wallet, badge: accounts.some((a) => a.creditRemaining < 0.2 && a.creditRemaining > 0) },
   ];
 
   return (
     <div className="fixed bottom-3.5 left-3 right-3 sm:left-6 sm:right-6 sm:max-w-md sm:mx-auto z-50 lg:hidden">
       <div className="rounded-2xl sm:rounded-3xl border border-white/10 bg-neutral-900/60 p-1.5 shadow-[0_8px_32px_0_rgba(0,0,0,0.55)] backdrop-blur-2xl backdrop-saturate-150 ring-1 ring-white/5">
-        <div className="grid grid-cols-5 items-center gap-1 text-center">
+        <div className="grid grid-cols-4 items-center gap-1 text-center">
           {tabs.map((tab) => {
             const Icon = tab.icon;
             const isActive = activeTab === tab.id;

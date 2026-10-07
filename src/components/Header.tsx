@@ -1,9 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Server,
   Plus,
-  ShieldCheck,
-  ShieldAlert,
   Wallet,
   ChevronDown,
   Layers,
@@ -17,19 +15,22 @@ import {
   AlertCircle,
   X,
   Send,
+  User,
+  Search,
+  Tag,
 } from 'lucide-react';
 import { useHub } from '../context/HubContext';
 import { logoutAuth } from '../services/authApi';
 import { TelegramBackupModal } from './TelegramBackupModal';
+import { PWAInstallButton } from './PWAInstallButton';
+import { AccountMenuModal } from './AccountMenuModal';
 
 interface HeaderProps {
   onOpenAddAccount: () => void;
-  onOpenBudgetGuard: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   onOpenAddAccount,
-  onOpenBudgetGuard,
 }) => {
   const {
     accounts,
@@ -48,7 +49,20 @@ export const Header: React.FC<HeaderProps> = ({
   } = useHub();
 
   const [accountDropdownOpen, setAccountDropdownOpen] = useState(false);
+  const [searchAccountQuery, setSearchAccountQuery] = useState('');
   const [isTelegramOpen, setIsTelegramOpen] = useState(false);
+  const [isAccountMenuOpen, setIsAccountMenuOpen] = useState(false);
+
+  const filteredDropdownAccounts = useMemo(() => {
+    const q = searchAccountQuery.trim().toLowerCase();
+    if (!q) return accounts;
+    return accounts.filter(
+      (a) =>
+        a.name.toLowerCase().includes(q) ||
+        a.email.toLowerCase().includes(q) ||
+        (a.tags || []).some((t) => t.toLowerCase().includes(q))
+    );
+  }, [accounts, searchAccountQuery]);
 
   const currentDisplayBalance = activeAccount
     ? activeAccount.creditRemaining
@@ -57,16 +71,12 @@ export const Header: React.FC<HeaderProps> = ({
   const currentLimit = activeAccount ? activeAccount.creditLimit : totalCreditsLimit;
   const balancePercentage = Math.max(0, Math.min(100, (currentDisplayBalance / (currentLimit || 1)) * 100));
 
-  const hasShutdownTriggered = activeAccount
-    ? activeAccount.isShutdownTriggered
-    : accounts.some((a) => a.isShutdownTriggered);
-
   return (
     <>
     <header className="sticky top-0 z-[1000] w-full max-w-full border-b border-neutral-800/80 bg-neutral-950/90 backdrop-blur-xl transition-colors">
       <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-3 py-2 sm:px-6">
         
-        {/* Left Side: Brand & Navigation */}
+        {/* Left Side: Brand */}
         <div className="flex items-center gap-2 sm:gap-4 shrink-0 min-w-0">
           <div className="flex items-center gap-2 cursor-pointer shrink-0" onClick={() => setActiveTab('dashboard')}>
             <div className="relative flex h-8 w-8 sm:h-9 sm:w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-tr from-purple-600 via-indigo-600 to-violet-500 shadow-md shadow-purple-500/20 ring-1 ring-purple-400/30">
@@ -88,74 +98,18 @@ export const Header: React.FC<HeaderProps> = ({
               <p className="hidden text-[11px] text-neutral-400 md:block leading-tight mt-0.5">مدیریت متمرکز نودها و اکانت‌ها</p>
             </div>
           </div>
-
-          {/* Desktop Navigation Tabs */}
-          <nav className="hidden lg:flex items-center gap-1 rounded-xl bg-neutral-900/90 p-1 ring-1 ring-neutral-800">
-            <button
-              onClick={() => setActiveTab('dashboard')}
-              className={`flex items-center gap-1.5 rounded-lg px-2.5 xl:px-3 py-1.5 text-xs font-medium transition-all ${
-                activeTab === 'dashboard'
-                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
-                  : 'text-neutral-400 hover:text-neutral-200'
-              }`}
-            >
-              <Layers className="h-3.5 w-3.5" />
-              داشبورد
-            </button>
-            <button
-              onClick={() => setActiveTab('nodes')}
-              className={`flex items-center gap-1.5 rounded-lg px-2.5 xl:px-3 py-1.5 text-xs font-medium transition-all ${
-                activeTab === 'nodes'
-                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
-                  : 'text-neutral-400 hover:text-neutral-200'
-              }`}
-            >
-              <Activity className="h-3.5 w-3.5" />
-              نودها و سرویس‌ها
-            </button>
-            <button
-              onClick={() => setActiveTab('logs')}
-              className={`flex items-center gap-1.5 rounded-lg px-2.5 xl:px-3 py-1.5 text-xs font-medium transition-all ${
-                activeTab === 'logs'
-                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
-                  : 'text-neutral-400 hover:text-neutral-200'
-              }`}
-            >
-              <Terminal className="h-3.5 w-3.5" />
-              لاگ زنده
-            </button>
-            <button
-              onClick={() => setActiveTab('metrics')}
-              className={`flex items-center gap-1.5 rounded-lg px-2.5 xl:px-3 py-1.5 text-xs font-medium transition-all ${
-                activeTab === 'metrics'
-                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
-                  : 'text-neutral-400 hover:text-neutral-200'
-              }`}
-            >
-              <BarChart3 className="h-3.5 w-3.5" />
-              مصرف منابع
-            </button>
-            <button
-              onClick={() => setActiveTab('accounts')}
-              className={`flex items-center gap-1.5 rounded-lg px-2.5 xl:px-3 py-1.5 text-xs font-medium transition-all ${
-                activeTab === 'accounts'
-                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
-                  : 'text-neutral-400 hover:text-neutral-200'
-              }`}
-            >
-              <Wallet className="h-3.5 w-3.5" />
-              اکانت‌ها ({accounts.length})
-            </button>
-          </nav>
         </div>
 
-        {/* Right Side: Quick Switcher, Budget Guard, Deploy */}
+        {/* Right Side: Quick Switcher, Balance, Deploy */}
         <div className="flex items-center gap-1 sm:gap-2 shrink-0">
           
           {/* Active Account Switcher Dropdown */}
           <div className="relative">
             <button
-              onClick={() => setAccountDropdownOpen(!accountDropdownOpen)}
+              onClick={() => {
+                setAccountDropdownOpen(!accountDropdownOpen);
+                setSearchAccountQuery('');
+              }}
               className="flex items-center gap-1 sm:gap-1.5 rounded-xl bg-neutral-900 border border-neutral-800 px-2 py-1 sm:px-2.5 sm:py-1.5 text-xs font-medium text-neutral-200 hover:border-neutral-700 transition"
             >
               <div
@@ -163,8 +117,26 @@ export const Header: React.FC<HeaderProps> = ({
                 style={{ backgroundColor: activeAccount ? activeAccount.color : '#8B5CF6' }}
               />
               <span className="max-w-[65px] xs:max-w-[100px] sm:max-w-[150px] truncate text-[11px] sm:text-xs">
-                {activeAccount ? activeAccount.name : 'اکانت‌ها'}
+                {activeAccount ? activeAccount.name : 'همه اکانت‌ها'}
               </span>
+              {activeAccount?.tags && activeAccount.tags.length > 0 && (
+                <div className="hidden md:flex items-center gap-1 shrink-0">
+                  {activeAccount.tags.slice(0, 2).map((t) => (
+                    <span
+                      key={t}
+                      className="inline-flex items-center gap-0.5 rounded bg-purple-500/15 border border-purple-500/30 px-1 py-0 text-[9px] font-sans text-purple-300"
+                    >
+                      <Tag className="h-2 w-2 text-purple-400" />
+                      <span className="truncate max-w-[60px]">{t}</span>
+                    </span>
+                  ))}
+                  {activeAccount.tags.length > 2 && (
+                    <span className="text-[9px] text-neutral-500 font-mono">
+                      +{activeAccount.tags.length - 2}
+                    </span>
+                  )}
+                </div>
+              )}
               <ChevronDown className="h-3 w-3 text-neutral-400 shrink-0" />
             </button>
 
@@ -177,11 +149,11 @@ export const Header: React.FC<HeaderProps> = ({
                 />
 
                 <div
-                  className="absolute left-0 top-full mt-2 w-64 max-w-[calc(100vw-2rem)] rounded-2xl border border-neutral-800 bg-neutral-900/98 p-2 shadow-2xl backdrop-blur-2xl z-[1060] animate-in fade-in zoom-in-95 ring-1 ring-white/10"
-                  onClick={() => setAccountDropdownOpen(false)}
+                  className="absolute left-0 top-full mt-2 w-80 max-w-[calc(100vw-2rem)] rounded-2xl border border-neutral-800 bg-neutral-900/98 p-2.5 shadow-2xl backdrop-blur-2xl z-[1060] animate-in fade-in zoom-in-95 ring-1 ring-white/10"
+                  onClick={(e) => e.stopPropagation()}
                 >
-                  <div className="px-2 py-1.5 text-[11px] font-semibold text-neutral-400 flex items-center justify-between">
-                    <span>انتخاب اکانت فعال</span>
+                  <div className="px-2 py-1 text-[11px] font-semibold text-neutral-400 flex items-center justify-between">
+                    <span>انتخاب اکانت فعال ({accounts.length})</span>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -190,51 +162,130 @@ export const Header: React.FC<HeaderProps> = ({
                       className="text-purple-400 hover:text-purple-300 text-[10px] flex items-center gap-1"
                     >
                       <RefreshCw className={`h-3 w-3 ${isSyncingProjects ? 'animate-spin' : ''}`} />
-                      <span>همگام‌سازی پروژه‌ها</span>
+                      <span>همگام‌سازی</span>
                     </button>
                   </div>
-                  {accounts.map((acc) => (
-                    <button
-                      key={acc.id}
-                      onClick={() => setActiveAccountId(acc.id)}
-                      className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-xs transition ${
-                        activeAccountId === acc.id
-                          ? 'bg-neutral-800 text-white font-medium ring-1 ring-neutral-700'
-                          : 'text-neutral-300 hover:bg-neutral-800/60'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 truncate">
-                        <div className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: acc.color }} />
-                        <span className="truncate">{acc.name}</span>
-                      </div>
-                      <div className="flex items-center gap-1.5 text-left font-mono text-[11px] shrink-0">
-                        <span className={acc.creditRemaining < acc.autoShutdownThreshold ? 'text-rose-400 font-bold' : 'text-emerald-400'}>
-                          ${acc.creditRemaining.toFixed(2)}
-                        </span>
-                        {typeof acc.creditExpiresInDays === 'number' && (
-                          <span
-                            className={`text-[9px] px-1 py-0.5 rounded ${
-                              acc.creditExpiresInDays <= 3
-                                ? 'bg-rose-500/15 text-rose-300'
-                                : 'bg-amber-500/10 text-amber-300'
-                            }`}
-                            title={
-                              acc.billingPeriodEnd
-                                ? `روزهای باقی‌مانده اعتبار · ریست دوره: ${acc.billingPeriodEnd}`
-                                : undefined
-                            }
-                          >
-                            {acc.creditExpiresInDays}روز
-                          </span>
-                        )}
-                      </div>
-                    </button>
-                  ))}
 
-                  <div className="my-1 border-t border-neutral-800" />
+                  {/* Search inside dropdown when accounts > 3 */}
+                  {accounts.length > 3 && (
+                    <div className="relative my-1.5">
+                      <Search className="absolute right-2.5 top-1/2 -translate-y-1/2 h-3 w-3 text-neutral-500" />
+                      <input
+                        type="text"
+                        value={searchAccountQuery}
+                        onChange={(e) => setSearchAccountQuery(e.target.value)}
+                        placeholder="جستجوی سریع اکانت یا تگ..."
+                        className="w-full rounded-xl border border-neutral-800 bg-neutral-950 py-1 pr-7 pl-2 text-[11px] text-white placeholder-neutral-500 focus:border-purple-500 focus:outline-none"
+                      />
+                      {searchAccountQuery && (
+                        <button
+                          onClick={() => setSearchAccountQuery('')}
+                          className="absolute left-2 top-1/2 -translate-y-1/2 text-neutral-500 hover:text-white"
+                        >
+                          <X className="h-2.5 w-2.5" />
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* All Accounts Option */}
+                  <button
+                    onClick={() => {
+                      setActiveAccountId('all');
+                      setAccountDropdownOpen(false);
+                    }}
+                    className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-xs transition my-1 ${
+                      activeAccountId === 'all'
+                        ? 'bg-purple-950/50 text-purple-200 font-semibold ring-1 ring-purple-500/40'
+                        : 'text-neutral-300 hover:bg-neutral-800/60'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 truncate">
+                      <div className="h-2 w-2 rounded-full bg-gradient-to-tr from-purple-500 to-indigo-400 shrink-0" />
+                      <span className="truncate font-bold">همه اکانت‌ها (نمای جامع)</span>
+                    </div>
+                    <span className="font-mono text-emerald-400 font-bold text-[11px]">
+                      ${totalCreditsRemaining.toFixed(2)}
+                    </span>
+                  </button>
+
+                  <div className="my-1 border-t border-neutral-800/80" />
+
+                  {/* Scrollable Accounts List */}
+                  <div className="max-h-56 sm:max-h-64 overflow-y-auto space-y-1 pr-0.5 custom-scrollbar">
+                    {filteredDropdownAccounts.length === 0 ? (
+                      <div className="py-3 text-center text-[10px] text-neutral-500">
+                        اکانتی یافت نشد
+                      </div>
+                    ) : (
+                      filteredDropdownAccounts.map((acc) => (
+                        <button
+                          key={acc.id}
+                          onClick={() => {
+                            setActiveAccountId(acc.id);
+                            setAccountDropdownOpen(false);
+                          }}
+                          className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-xs transition ${
+                            activeAccountId === acc.id
+                              ? 'bg-neutral-800 text-white font-medium ring-1 ring-neutral-700'
+                              : 'text-neutral-300 hover:bg-neutral-800/60'
+                          }`}
+                        >
+                          <div className="flex flex-col items-start min-w-0 pr-1 flex-1 text-right">
+                            <div className="flex items-center gap-1.5 max-w-full truncate">
+                              <div className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: acc.color }} />
+                              <span className="truncate font-semibold text-neutral-100">{acc.name}</span>
+                            </div>
+
+                            {/* Tags display (read-only) */}
+                            {acc.tags && acc.tags.length > 0 && (
+                              <div className="flex items-center gap-1 mt-1 flex-wrap max-w-full">
+                                {acc.tags.map((tag) => (
+                                  <span
+                                    key={tag}
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-purple-500/15 border border-purple-500/30 px-1.5 py-0.2 text-[8px] font-sans font-medium text-purple-300 truncate max-w-[100px]"
+                                  >
+                                    <Tag className="h-2 w-2 text-purple-400 shrink-0" />
+                                    <span className="truncate">{tag}</span>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1.5 text-left font-mono text-[11px] shrink-0 mr-2">
+                            <span className="text-emerald-400 font-bold">
+                              ${acc.creditRemaining.toFixed(2)}
+                            </span>
+                            {typeof acc.creditExpiresInDays === 'number' && (
+                              <span
+                                className={`text-[9px] px-1 py-0.5 rounded ${
+                                  acc.creditExpiresInDays <= 3
+                                    ? 'bg-rose-500/15 text-rose-300'
+                                    : 'bg-amber-500/10 text-amber-300'
+                                }`}
+                                title={
+                                  acc.billingPeriodEnd
+                                    ? `روزهای باقی‌مانده اعتبار · ریست دوره: ${acc.billingPeriodEnd}`
+                                    : undefined
+                                }
+                              >
+                                {acc.creditExpiresInDays}روز
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="my-1 border-t border-neutral-800/80" />
 
                   <button
-                    onClick={() => onOpenAddAccount()}
+                    onClick={() => {
+                      setAccountDropdownOpen(false);
+                      onOpenAddAccount();
+                    }}
                     className="flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-xs text-purple-400 hover:bg-purple-500/10 transition font-medium"
                   >
                     <Plus className="h-3.5 w-3.5" />
@@ -245,36 +296,29 @@ export const Header: React.FC<HeaderProps> = ({
             )}
           </div>
 
-          {/* Quick Balance & Budget Guard Badge */}
+          {/* Quick Balance Status Badge */}
           <button
-            onClick={onOpenBudgetGuard}
+            onClick={() => setActiveTab('accounts')}
             className="hidden md:flex items-center gap-2 rounded-xl bg-neutral-900/90 border border-neutral-800 px-3 py-1.5 text-xs hover:border-neutral-700 transition"
-            title="مدیریت محافظ بودجه و توقف خودکار"
+            title="مشاهده جزئیات اعتبار اکانت‌ها"
           >
-            {hasShutdownTriggered ? (
-              <ShieldAlert className="h-3.5 w-3.5 text-rose-400 animate-pulse" />
-            ) : (
-              <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
-            )}
+            <Wallet className="h-3.5 w-3.5 text-purple-400" />
             <div className="flex items-center gap-1">
               <span className="text-neutral-400 text-[11px]">اعتبار:</span>
-              <span
-                className={`font-mono font-semibold ${
-                  currentDisplayBalance < 1 ? 'text-rose-400' : 'text-emerald-400'
-                }`}
-              >
+              <span className="font-mono font-semibold text-emerald-400">
                 ${currentDisplayBalance.toFixed(2)}
               </span>
             </div>
             <div className="h-1.5 w-8 overflow-hidden rounded-full bg-neutral-800">
               <div
-                className={`h-full rounded-full transition-all duration-500 ${
-                  balancePercentage > 40 ? 'bg-emerald-500' : balancePercentage > 15 ? 'bg-amber-500' : 'bg-rose-500'
-                }`}
+                className="h-full rounded-full bg-emerald-500 transition-all duration-500"
                 style={{ width: `${balancePercentage}%` }}
               />
             </div>
           </button>
+
+          {/* PWA Install Button */}
+          <PWAInstallButton />
 
           {/* Refresh Balances & Sync Projects Button */}
           <button
@@ -297,17 +341,77 @@ export const Header: React.FC<HeaderProps> = ({
             <Send className="h-3 w-3 sm:h-4 sm:w-4" />
           </button>
 
-          {/* Logout */}
+          {/* User Account & Security Button */}
           <button
-            onClick={async () => {
-              await logoutAuth();
-              window.location.reload();
-            }}
-            className="flex h-7 w-7 sm:h-9 sm:w-9 items-center justify-center rounded-lg sm:rounded-xl bg-neutral-900 border border-neutral-800 text-neutral-400 hover:text-rose-400 hover:border-rose-500/40 transition shrink-0"
-            title="خروج از حساب"
+            onClick={() => setIsAccountMenuOpen(true)}
+            className="flex h-7 sm:h-9 items-center gap-1.5 rounded-lg sm:rounded-xl bg-neutral-900 border border-neutral-800 px-2 sm:px-2.5 text-neutral-300 hover:text-white hover:border-purple-500/40 hover:bg-purple-500/10 transition shrink-0"
+            title="حساب کاربری، تغییر رمز و خروج"
           >
-            <LogOut className="h-3 w-3 sm:h-4 sm:w-4" />
+            <div className="flex h-4 w-4 sm:h-5 sm:w-5 items-center justify-center rounded-md bg-gradient-to-tr from-purple-600 to-indigo-600 text-white shrink-0 shadow-sm">
+              <User className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
+            </div>
+            <span className="text-[11px] sm:text-xs font-medium font-mono hidden xs:inline">admin</span>
           </button>
+        </div>
+      </div>
+
+      {/* Secondary Desktop Navigation Row */}
+      <div className="hidden lg:block border-t border-neutral-800/60 bg-neutral-950/60 backdrop-blur-md">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-3 py-1.5 sm:px-6">
+          <nav className="flex items-center gap-1.5">
+            <button
+              onClick={() => setActiveTab('dashboard')}
+              className={`flex items-center gap-2 rounded-xl px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                activeTab === 'dashboard'
+                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
+                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-900/80'
+              }`}
+            >
+              <Layers className="h-3.5 w-3.5" />
+              <span>داشبورد</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('nodes')}
+              className={`flex items-center gap-2 rounded-xl px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                activeTab === 'nodes'
+                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
+                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-900/80'
+              }`}
+            >
+              <Activity className="h-3.5 w-3.5" />
+              <span>نودها و سرویس‌ها</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('metrics')}
+              className={`flex items-center gap-2 rounded-xl px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                activeTab === 'metrics'
+                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
+                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-900/80'
+              }`}
+            >
+              <BarChart3 className="h-3.5 w-3.5" />
+              <span>مصرف منابع</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('accounts')}
+              className={`flex items-center gap-2 rounded-xl px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                activeTab === 'accounts'
+                  ? 'bg-neutral-800 text-white shadow-sm ring-1 ring-white/10'
+                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-900/80'
+              }`}
+            >
+              <Wallet className="h-3.5 w-3.5" />
+              <span>اکانت‌ها</span>
+              <span className="rounded-full bg-purple-500/20 px-1.5 py-0.2 text-[10px] font-bold text-purple-300">
+                {accounts.length}
+              </span>
+            </button>
+          </nav>
+
+          <div className="flex items-center gap-2 text-[11px] text-neutral-400 font-medium">
+            <span className="flex h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span>مدیریت متمرکز پروژه‌ها</span>
+          </div>
         </div>
       </div>
 
@@ -355,6 +459,7 @@ export const Header: React.FC<HeaderProps> = ({
     </header>
 
     <TelegramBackupModal isOpen={isTelegramOpen} onClose={() => setIsTelegramOpen(false)} />
+    <AccountMenuModal isOpen={isAccountMenuOpen} onClose={() => setIsAccountMenuOpen(false)} />
     </>
   );
 };

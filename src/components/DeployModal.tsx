@@ -6,7 +6,6 @@ import {
   AlertCircle,
   RotateCw,
   FolderGit2,
-  Layers,
   Container,
   FileCode2,
   Terminal,
@@ -17,7 +16,6 @@ import {
   Check,
 } from 'lucide-react';
 import { useHub } from '../context/HubContext';
-import { TEMPLATES } from '../constants/initialData';
 import { normalizeGitHubRepo, extractApiError } from '../utils/githubRepo';
 import { RailwayServiceDomain } from '../types';
 import {
@@ -36,23 +34,27 @@ interface DeployModalProps {
 }
 
 export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => {
-  const { accounts, activeAccountId, deployService, syncAccountProjects, setDeployJob } = useHub();
+  const {
+    accounts,
+    activeAccountId,
+    deployService,
+    syncAccountProjects,
+    setDeployJob,
+    setServiceDeployState,
+  } = useHub();
 
   const [selectedAccountId, setSelectedAccountId] = useState<string>(
     activeAccountId !== 'all' ? activeAccountId : accounts[0]?.id || ''
   );
   const [selectedProjectId, setSelectedProjectId] = useState<string>('');
   const [activeDeployTab, setActiveTabMethod] = useState<
-    'github' | 'template' | 'registry' | 'docker-compose' | 'cli' | 'webhook' | 'agent'
+    'github' | 'registry' | 'docker-compose' | 'cli' | 'webhook' | 'agent'
   >('github');
 
   // GitHub Repo Tab
   const [githubRepo, setGithubRepo] = useState<string>('');
   const [githubBranch, setGithubBranch] = useState<string>('');
   const [branchTouched, setBranchTouched] = useState<boolean>(false);
-
-  // Template Tab
-  const [selectedTemplate, setSelectedTemplate] = useState<string>('nodejs');
 
   // Docker Registry Tab
   const [registryImage, setRegistryImage] = useState<string>('nginx:alpine');
@@ -78,7 +80,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
   const [deployedDomain, setDeployedDomain] = useState<string | null>(null);
 
   /** Mirrors progress into the global deployJob so the status stays visible
-   *  (in the header banner and the service card) even after this modal closes. */
+   *  in the header banner. */
   const reportPhase = (phase: string, extra?: { repo?: string; domain?: string; serviceId?: string }) => {
     setDeployPhase(phase);
     setDeployJob((prev) => ({
@@ -88,6 +90,13 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
       domain: extra?.domain ?? prev?.domain,
       serviceId: extra?.serviceId ?? prev?.serviceId,
     }));
+    if (extra?.serviceId) {
+      setServiceDeployState(extra.serviceId, {
+        status: 'running',
+        phase,
+        domain: extra.domain,
+      });
+    }
   };
 
   const targetAccount = accounts.find((a) => a.id === selectedAccountId) || accounts[0];
@@ -119,19 +128,6 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
   if (!isOpen) return null;
 
   const targetProjectId = selectedProjectId || deployableProjects[0]?.id || '';
-
-  const handleTemplateChange = (tmplId: string) => {
-    setSelectedTemplate(tmplId);
-    const tmpl = TEMPLATES.find((t) => t.id === tmplId);
-    if (tmpl) {
-      setPort(tmpl.defaultPort);
-      setServiceName(`${tmplId}-service`);
-      const envLines = Object.entries(tmpl.defaultEnv)
-        .map(([k, v]) => `${k}=${v}`)
-        .join('\n');
-      setEnvVarsText(envLines);
-    }
-  };
 
   /** Throws the first real Railway/proxy error contained in a response. */
   const throwApiError = (res: any, fallback: string) => {
@@ -304,8 +300,8 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
     return { repo, branch, serviceId, projectId, environmentId, domain };
   };
 
-  /** Creates a real (empty) service on Railway — used by template/custom and
-   *  the CLI / Webhook / Agent flows. */
+  /** Creates a real (empty) service on Railway — used by the CLI / Webhook /
+   *  Agent flows. */
   const createRealService = async (opts: {
     token: string;
     projectId: string;
@@ -331,11 +327,18 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
       return;
     }
 
-    setIsDeploying(true);
-    setErrorMsg(null);
-    setDeployPhase(null);
-    setDeployJob(null);
-    setDeployedDomain(null);
+    // Capture current form values
+    const chosenAccount = targetAccount;
+    const chosenProjectId = targetProjectId;
+    const chosenServiceName = serviceName;
+    const chosenPort = port;
+    const chosenGithubRepo = githubRepo;
+    const chosenGithubBranch = githubBranch;
+    const chosenBranchTouched = branchTouched;
+    const chosenTab = activeDeployTab;
+    const chosenComposeYaml = composeYaml;
+    const chosenRegistryImage = registryImage;
+    const chosenRegistryPort = registryPort;
 
     // Parse env vars
     const envVars: Record<string, string> = {};
@@ -348,57 +351,39 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
       }
     });
 
-    try {
-      if (activeDeployTab === 'github') {
-        // Method 1: GitHub Repo Deploy via live GraphQL API
-        // Full guide flow: deploy → poll build → create domain with targetPort
-        const flow = await runGitHubDeployFlow(githubRepo, {
-          token: targetAccount.token,
-          projectId: targetProjectId,
-          branch: githubBranch,
-          preferDefaultBranch: !branchTouched,
-          port,
-        });
-        setDeployedDomain(flow.domain);
+    // Close the popup immediately as requested
+    setIsDeploying(false);
+    setErrorMsg(null);
+    onClose();
 
-        // flow.projectId is the REAL project the server deployed into — it
-        // differs from targetProjectId when a missing project was recreated.
-        await deployService(targetAccount.id, flow.projectId || targetProjectId, {
-          name: serviceName || flow.repo.split('/')[1] || 'github-app',
-          templateType: 'custom',
-          imageOrRepo: `${flow.repo} @ ${flow.branch}`,
-          port,
-          envVars,
-          railwayServiceId: flow.serviceId,
-          domains: flow.domain
-            ? [
-                {
-                  id: `deploy-domain-${Date.now()}`,
-                  domain: flow.domain,
-                  targetPort: port,
-                  kind: 'service',
-                  environmentId: flow.environmentId || undefined,
-                } as RailwayServiceDomain,
-              ]
-            : undefined,
+    // Run deployment in the background and update global deployJob
+    (async () => {
+      try {
+        setDeployJob({
+          status: 'running',
+          phase: 'شروع دپلوی روی ریلوی...',
         });
-      } else if (activeDeployTab === 'template') {
-        // Method 2: Ready-made templates — each one triggers a REAL deploy
-        const tmpl = TEMPLATES.find((t) => t.id === selectedTemplate) || TEMPLATES[0];
 
-        if (tmpl.deployMethod === 'github' && tmpl.repo) {
-          const flow = await runGitHubDeployFlow(tmpl.repo, {
-            token: targetAccount.token,
-            projectId: targetProjectId,
-            preferDefaultBranch: true,
-            port,
+        if (chosenTab === 'github') {
+          setDeployJob({
+            status: 'running',
+            phase: 'ارسال درخواست دپلوی ریپوزیتوری گیت‌هاب به ریلوی...',
+            repo: chosenGithubRepo,
           });
-          setDeployedDomain(flow.domain);
-          await deployService(targetAccount.id, flow.projectId || targetProjectId, {
-            name: serviceName || `${tmpl.id}-service`,
-            templateType: tmpl.id,
+
+          const flow = await runGitHubDeployFlow(chosenGithubRepo, {
+            token: chosenAccount.token,
+            projectId: chosenProjectId,
+            branch: chosenGithubBranch,
+            preferDefaultBranch: !chosenBranchTouched,
+            port: chosenPort,
+          });
+
+          await deployService(chosenAccount.id, flow.projectId || chosenProjectId, {
+            name: chosenServiceName || flow.repo.split('/')[1] || 'github-app',
+            templateType: 'custom',
             imageOrRepo: `${flow.repo} @ ${flow.branch}`,
-            port,
+            port: chosenPort,
             envVars,
             railwayServiceId: flow.serviceId,
             domains: flow.domain
@@ -406,127 +391,145 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
                   {
                     id: `deploy-domain-${Date.now()}`,
                     domain: flow.domain,
-                    targetPort: port,
+                    targetPort: chosenPort,
                     kind: 'service',
                     environmentId: flow.environmentId || undefined,
                   } as RailwayServiceDomain,
                 ]
               : undefined,
           });
-        } else if (tmpl.deployMethod === 'image' && tmpl.image) {
+
+          await syncAccountProjects(chosenAccount.id);
+
+          if (flow.serviceId) {
+            setServiceDeployState(flow.serviceId, {
+              status: 'success',
+              phase: 'دیپلوی موفق',
+              domain: flow.domain || undefined,
+            });
+          }
+
+          setDeployJob({
+            status: 'success',
+            phase: flow.domain
+              ? `دیپلوی موفق — دامنه: ${flow.domain}`
+              : 'دیپلوی سرویس با موفقیت انجام شد',
+            domain: flow.domain || undefined,
+            repo: flow.repo,
+            serviceId: flow.serviceId,
+          });
+        } else if (chosenTab === 'docker-compose') {
+          setDeployJob({
+            status: 'running',
+            phase: 'در حال وارد کردن و ساخت سرویس‌های Docker Compose...',
+          });
+
+          const dcRes = await deployDockerComposeRailway({
+            token: chosenAccount.token,
+            projectId: chosenProjectId,
+            yaml: chosenComposeYaml,
+          });
+          throwApiError(dcRes, 'وارد کردن Docker Compose توسط ریلوی نپذیرفته شد');
+
+          const srvRes = await deployService(chosenAccount.id, dcRes?.resolvedProjectId || chosenProjectId, {
+            name: chosenServiceName || 'docker-compose-stack',
+            templateType: 'docker',
+            imageOrRepo: 'docker-compose.yml',
+            port: chosenPort,
+            envVars,
+          });
+
+          await syncAccountProjects(chosenAccount.id);
+
+          setDeployJob({
+            status: 'success',
+            phase: 'سرویس Docker Compose با موفقیت ساخته شد',
+          });
+        } else if (chosenTab === 'registry') {
+          setDeployJob({
+            status: 'running',
+            phase: `در حال ساخت سرویس با ایمیج ${chosenRegistryImage}...`,
+          });
+
           const svcRes = await createRealService({
-            token: targetAccount.token,
-            projectId: targetProjectId,
-            name: serviceName || `${tmpl.id}-service`,
-            image: tmpl.image,
+            token: chosenAccount.token,
+            projectId: chosenProjectId,
+            name: chosenServiceName || 'registry-service',
+            image: chosenRegistryImage,
             variables: envVars,
           });
-          await deployService(targetAccount.id, svcRes?.resolvedProjectId || targetProjectId, {
-            name: serviceName || `${tmpl.id}-service`,
-            templateType: tmpl.id,
-            imageOrRepo: tmpl.image,
-            port,
+
+          const svcId = svcRes?.data?.serviceCreate?.id;
+
+          await deployService(chosenAccount.id, svcRes?.resolvedProjectId || chosenProjectId, {
+            name: chosenServiceName || 'registry-service',
+            templateType: 'docker',
+            imageOrRepo: chosenRegistryImage,
+            port: chosenRegistryPort,
             envVars,
+            railwayServiceId: svcId,
+          });
+
+          await syncAccountProjects(chosenAccount.id);
+
+          if (svcId) {
+            setServiceDeployState(svcId, {
+              status: 'success',
+              phase: `سرویس با ایمیج ${chosenRegistryImage} با موفقیت ساخته شد`,
+            });
+          }
+
+          setDeployJob({
+            status: 'success',
+            phase: `سرویس با ایمیج ${chosenRegistryImage} با موفقیت ساخته شد`,
+            serviceId: svcId,
           });
         } else {
+          setDeployJob({
+            status: 'running',
+            phase: 'در حال ساخت سرویس جدید روی ریلوی...',
+          });
+
           const svcRes = await createRealService({
-            token: targetAccount.token,
-            projectId: targetProjectId,
-            name: serviceName || `${tmpl.id}-service`,
+            token: chosenAccount.token,
+            projectId: chosenProjectId,
+            name: chosenServiceName || 'empty-service',
             variables: envVars,
           });
-          await deployService(targetAccount.id, svcRes?.resolvedProjectId || targetProjectId, {
-            name: serviceName || `${tmpl.id}-service`,
-            templateType: tmpl.id,
+
+          const svcId = svcRes?.data?.serviceCreate?.id;
+
+          await deployService(chosenAccount.id, svcRes?.resolvedProjectId || chosenProjectId, {
+            name: chosenServiceName || 'empty-service',
+            templateType: 'custom',
             imageOrRepo: 'empty-service',
-            port,
+            port: chosenPort,
             envVars,
+            railwayServiceId: svcId,
+          });
+
+          await syncAccountProjects(chosenAccount.id);
+
+          if (svcId) {
+            setServiceDeployState(svcId, {
+              status: 'success',
+              phase: 'سرویس روی ریلوی با موفقیت ساخته شد',
+            });
+          }
+
+          setDeployJob({
+            status: 'success',
+            phase: 'سرویس روی ریلوی با موفقیت ساخته شد',
+            serviceId: svcId,
           });
         }
-      } else if (activeDeployTab === 'docker-compose') {
-        // Method 3: Docker Compose Import (real environmentId resolved server-side)
-        const dcRes = await deployDockerComposeRailway({
-          token: targetAccount.token,
-          projectId: targetProjectId,
-          yaml: composeYaml,
-        });
-        throwApiError(dcRes, 'وارد کردن Docker Compose توسط ریلوی نپذیرفته شد');
-
-        await deployService(targetAccount.id, dcRes?.resolvedProjectId || targetProjectId, {
-          name: serviceName || 'docker-compose-stack',
-          templateType: 'docker',
-          imageOrRepo: 'docker-compose.yml',
-          port,
-          envVars,
-        });
-      } else if (activeDeployTab === 'registry') {
-        // Method 4: Registry Image (real serviceCreate with source.image)
-        const svcRes = await createRealService({
-          token: targetAccount.token,
-          projectId: targetProjectId,
-          name: serviceName || 'registry-service',
-          image: registryImage,
-          variables: envVars,
-        });
-
-        await deployService(targetAccount.id, svcRes?.resolvedProjectId || targetProjectId, {
-          name: serviceName || 'registry-service',
-          templateType: 'docker',
-          imageOrRepo: registryImage,
-          port: registryPort,
-          envVars,
-        });
-      } else {
-        // Methods 5/6/7 (CLI / Webhook / Agent): create a real empty service
-        // on Railway so the subsequent CLI upload / trigger actually has a target.
-        const svcRes = await createRealService({
-          token: targetAccount.token,
-          projectId: targetProjectId,
-          name: serviceName || 'empty-service',
-          variables: envVars,
-        });
-
-        await deployService(targetAccount.id, svcRes?.resolvedProjectId || targetProjectId, {
-          name: serviceName || 'empty-service',
-          templateType: 'custom',
-          imageOrRepo: 'empty-service',
-          port,
-          envVars,
+      } catch (err: any) {
+        setDeployJob({
+          status: 'error',
+          phase: err.message || 'دیپلوی ناموفق بود',
         });
       }
-
-      // The deploy may have auto-created the target project — pull it and the
-      // new service into hub state right away instead of waiting for the next
-      // periodic sync (30s) to discover them.
-      await syncAccountProjects(targetAccount.id);
-
-      setIsDeploying(false);
-      setDeploySuccess(true);
-      setDeployJob((prev) => ({
-        status: 'success',
-        phase: deployedDomain
-          ? `دیپلوی موفق — دامنه: ${deployedDomain}`
-          : 'دیپلوی سرویس با موفقیت انجام شد',
-        domain: deployedDomain || undefined,
-        repo: prev?.repo,
-        serviceId: prev?.serviceId,
-      }));
-
-      // Keep the result on screen long enough to read/copy the domain.
-      setTimeout(() => {
-        setDeploySuccess(false);
-        onClose();
-      }, deployedDomain ? 6000 : 2000);
-    } catch (err: any) {
-      setIsDeploying(false);
-      setErrorMsg(err.message || 'خطا در برقراری ارتباط با API دیپلوی ریلوی');
-      setDeployJob((prev) => ({
-        status: 'error',
-        phase: err.message || 'دیپلوی ناموفق بود',
-        repo: prev?.repo,
-        serviceId: prev?.serviceId,
-      }));
-    }
+    })();
   };
 
   const cliTargetProjectId = targetProjectId || 'project-id';
@@ -549,7 +552,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
             <div>
               <h2 className="text-sm sm:text-base font-black text-white">مرکز دپلوی و ساخت سرویس جدید در Railway</h2>
               <p className="text-[11px] text-neutral-400">
-                پشتیبانی از ۷ روش رسمی دیپلوی مستقیم API ریلوی (گیت‌هاب، تمپلیت، کامپوز، داکر رجستری و CLI)
+                پشتیبانی از ۶ روش رسمی دیپلوی مستقیم API ریلوی (گیت‌هاب، کامپوز، داکر رجستری و CLI)
               </p>
             </div>
           </div>
@@ -646,7 +649,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
               <label className="block text-xs font-semibold text-neutral-300 mb-1.5">
                 روش دیپلوی سرویس
               </label>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 rounded-2xl bg-neutral-950 p-1.5 border border-neutral-800">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 rounded-2xl bg-neutral-950 p-1.5 border border-neutral-800">
                 <button
                   type="button"
                   onClick={() => setActiveTabMethod('github')}
@@ -658,19 +661,6 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
                 >
                   <FolderGit2 className="h-3.5 w-3.5" />
                   <span>GitHub Repo</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setActiveTabMethod('template')}
-                  className={`flex items-center justify-center gap-1.5 rounded-xl py-2 px-2 text-[11px] font-medium transition ${
-                    activeDeployTab === 'template'
-                      ? 'bg-purple-600 text-white font-bold shadow-md'
-                      : 'text-neutral-400 hover:text-neutral-200'
-                  }`}
-                >
-                  <Layers className="h-3.5 w-3.5" />
-                  <span>Template آماده</span>
                 </button>
 
                 <button
@@ -728,7 +718,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
                 <button
                   type="button"
                   onClick={() => setActiveTabMethod('agent')}
-                  className={`flex items-center justify-center gap-1.5 rounded-xl py-2 px-2 text-[11px] font-medium transition col-span-2 sm:col-span-2 ${
+                  className={`flex items-center justify-center gap-1.5 rounded-xl py-2 px-2 text-[11px] font-medium transition ${
                     activeDeployTab === 'agent'
                       ? 'bg-purple-600 text-white font-bold shadow-md'
                       : 'text-neutral-400 hover:text-neutral-200'
@@ -787,65 +777,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
               </div>
             )}
 
-            {/* TAB CONTENT 2: Marketplace Templates */}
-            {activeDeployTab === 'template' && (
-              <div className="space-y-3">
-                <label className="block text-xs font-semibold text-neutral-300 mb-1">
-                  تمپلیت‌های آماده واقعی (دیپلوی مستقیم با API ریلوی)
-                </label>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-56 overflow-y-auto p-1 border border-neutral-800 rounded-2xl bg-neutral-950">
-                  {TEMPLATES.map((tmpl) => {
-                    const isSelected = selectedTemplate === tmpl.id;
-                    const methodLabel =
-                      tmpl.deployMethod === 'github'
-                        ? 'گیت‌هاب'
-                        : tmpl.deployMethod === 'image'
-                        ? 'ایمیج داکر'
-                        : 'سرویس خالی';
-                    const methodColor =
-                      tmpl.deployMethod === 'github'
-                        ? 'bg-purple-500/15 text-purple-300 border-purple-500/30'
-                        : tmpl.deployMethod === 'image'
-                        ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
-                        : 'bg-neutral-700/40 text-neutral-300 border-neutral-600';
-                    return (
-                      <div
-                        key={tmpl.id}
-                        onClick={() => handleTemplateChange(tmpl.id)}
-                        className={`cursor-pointer rounded-xl border p-2.5 transition ${
-                          isSelected
-                            ? 'border-purple-500 bg-purple-600/10 ring-1 ring-purple-500/30'
-                            : 'border-neutral-800 bg-neutral-900 hover:border-neutral-700'
-                        }`}
-                      >
-                        <div className="text-lg mb-0.5">{tmpl.icon}</div>
-                        <div className="text-xs font-bold text-white truncate">{tmpl.name}</div>
-                        <div className="text-[9px] text-neutral-400 mt-0.5 line-clamp-2">
-                          {tmpl.description}
-                        </div>
-                        <div className="mt-1.5 flex items-center justify-between gap-1">
-                          <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${methodColor}`}>
-                            {methodLabel}
-                          </span>
-                          {(tmpl.repo || tmpl.image) && (
-                            <span className="text-[8px] font-mono text-neutral-500 truncate" dir="ltr">
-                              {tmpl.repo || tmpl.image}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                <p className="text-[11px] text-neutral-400 leading-relaxed">
-                  هر تمپلیت یک منبع واقعی دارد: تمپلیت‌های گیت‌هابی با <span className="font-mono text-purple-300">githubRepoDeploy</span>،
-                  دیتابیس‌ها با <span className="font-mono text-purple-300">serviceCreate + source.image</span> و سرویس خالی با
-                  ساخت واقعی سرویس روی پروژه انتخاب‌شده دیپلوی می‌شوند.
-                </p>
-              </div>
-            )}
-
-            {/* TAB CONTENT 3: Docker Registry Image */}
+            {/* TAB CONTENT 2: Docker Registry Image */}
             {activeDeployTab === 'registry' && (
               <div className="space-y-3 rounded-2xl border border-neutral-800 bg-neutral-950/60 p-3.5">
                 <div className="text-xs font-bold text-white flex items-center gap-1.5">
@@ -883,7 +815,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
               </div>
             )}
 
-            {/* TAB CONTENT 4: Docker Compose Import */}
+            {/* TAB CONTENT 3: Docker Compose Import */}
             {activeDeployTab === 'docker-compose' && (
               <div className="space-y-3 rounded-2xl border border-neutral-800 bg-neutral-950/60 p-3.5">
                 <div className="text-xs font-bold text-white flex items-center gap-1.5">
@@ -906,7 +838,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
               </div>
             )}
 
-            {/* TAB CONTENT 5: CLI / Source Upload */}
+            {/* TAB CONTENT 4: CLI / Source Upload */}
             {activeDeployTab === 'cli' && (
               <div className="space-y-3 rounded-2xl border border-neutral-800 bg-neutral-950/60 p-3.5">
                 <div className="text-xs font-bold text-white flex items-center gap-1.5">
@@ -932,7 +864,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
               </div>
             )}
 
-            {/* TAB CONTENT 6: Webhook / CI Trigger */}
+            {/* TAB CONTENT 5: Webhook / CI Trigger */}
             {activeDeployTab === 'webhook' && (
               <div className="space-y-3 rounded-2xl border border-neutral-800 bg-neutral-950/60 p-3.5">
                 <div className="text-xs font-bold text-white flex items-center gap-1.5">
@@ -947,7 +879,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
               </div>
             )}
 
-            {/* TAB CONTENT 7: Cloud Agent */}
+            {/* TAB CONTENT 6: Cloud Agent */}
             {activeDeployTab === 'agent' && (
               <div className="space-y-3 rounded-2xl border border-neutral-800 bg-neutral-950/60 p-3.5">
                 <div className="text-xs font-bold text-white flex items-center gap-1.5">

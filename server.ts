@@ -536,6 +536,82 @@ async function startServer() {
   /** Fetches all projects. Returns `null` when the Railway API could not be reached,
    *  so callers can distinguish a real empty account from a failed request and
    *  avoid marking live projects as deleted. */
+  /** Runs `fn` over `items` with at most `limit` calls in flight. Railway takes
+   *  ~1s per query (projects ≈3.5s, auditLogs ≈5s), so sequential awaits are
+   *  what made a full sync take minutes. */
+  async function mapWithLimit<T, R>(
+    items: T[],
+    limit: number,
+    fn: (item: T) => Promise<R>
+  ): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= items.length) break;
+        results[i] = await fn(items[i]);
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
+
+  /** Project ids removed from a workspace, from `auditLogs` (Method 2). Never
+   *  throws. Cached for 5 minutes: this query costs ~5s and a project deleted
+   *  seconds ago being marked a few minutes later costs nothing. */
+  const deletedIdsCache = new Map<string, { at: number; ids: string[] }>();
+  const DELETED_IDS_TTL_MS = 5 * 60_000;
+
+  async function fetchDeletedProjectIds(token: string, wsId: string): Promise<string[]> {
+    const cached = deletedIdsCache.get(wsId);
+    if (cached && Date.now() - cached.at < DELETED_IDS_TTL_MS) return cached.ids;
+    try {
+      const res = await fetch('https://backboard.railway.app/graphql/v2', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token.trim()}`,
+        },
+        body: JSON.stringify({
+          query: `
+            query GetAuditLogs($wsId: String!) {
+              auditLogs(first: 50, workspaceId: $wsId) {
+                edges {
+                  node {
+                    eventType
+                    createdAt
+                    payload
+                  }
+                }
+              }
+            }
+          `,
+          variables: { wsId },
+        }),
+      });
+      const data = await res.json();
+      const ids: string[] = [];
+      for (const edge of data?.data?.auditLogs?.edges || []) {
+        const node = edge?.node;
+        if (!node || node.eventType !== 'Project.deleted' || !node.payload) continue;
+        // Match by unique project ID only. Railway payloads look like
+        // { id, name }; names are NOT unique (auto-created projects reuse
+        // names), so name-based matching falsely marks live projects as deleted.
+        if (typeof node.payload === 'string') {
+          ids.push(node.payload);
+        } else if (node.payload.id || node.payload.projectId) {
+          ids.push(node.payload.id || node.payload.projectId);
+        }
+      }
+      deletedIdsCache.set(wsId, { at: Date.now(), ids });
+      return ids;
+    } catch (err) {
+      console.error('Failed fetching auditLogs', err);
+      return [];
+    }
+  }
+
   async function fetchAllProjectsWithDeleted(token: string): Promise<any[] | null> {
     const projectMap = new Map<string, any>();
     const deletedProjectNamesOrIds = new Set<string>();
@@ -565,50 +641,10 @@ async function startServer() {
       for (const ws of workspaces) {
         if (!ws.id) continue;
 
-        // Method 2: Fetch auditLogs for Project.deleted events
-        try {
-          const auditQuery = `
-            query GetAuditLogs($wsId: String!) {
-              auditLogs(first: 50, workspaceId: $wsId) {
-                edges {
-                  node {
-                    eventType
-                    createdAt
-                    payload
-                  }
-                }
-              }
-            }
-          `;
-          const auditRes = await fetch('https://backboard.railway.app/graphql/v2', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${token.trim()}`,
-            },
-            body: JSON.stringify({ query: auditQuery, variables: { wsId: ws.id } }),
-          });
-          const auditData = await auditRes.json();
-          const auditEdges = auditData.data?.auditLogs?.edges || [];
-          auditEdges.forEach((edge: any) => {
-            const node = edge.node;
-            if (node && node.eventType === 'Project.deleted') {
-              if (node.payload) {
-                // Match by unique project ID only. Railway payloads look like
-                // { id, name }; names are NOT unique (auto-created projects
-                // reuse names), so name-based matching falsely marks live
-                // projects as deleted.
-                if (typeof node.payload === 'string') {
-                  deletedProjectNamesOrIds.add(node.payload);
-                } else if (node.payload.id || node.payload.projectId) {
-                  deletedProjectNamesOrIds.add(node.payload.id || node.payload.projectId);
-                }
-              }
-            }
-          });
-        } catch (auditErr) {
-          console.error('Failed fetching auditLogs', auditErr);
-        }
+        // Method 2 (Project.deleted ids) doesn't depend on the project list, so
+        // start it FIRST and let it overlap the ~3.5s project query instead of
+        // stacking ~5s of auditLogs in front of it.
+        const auditIdsPromise = fetchDeletedProjectIds(token, ws.id);
 
         // Method 1: Query projects with includeDeleted: true
         const q = `
@@ -638,6 +674,14 @@ async function startServer() {
                       }
                     }
                   }
+                  volumes {
+                    edges {
+                      node {
+                        id
+                        name
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -653,6 +697,38 @@ async function startServer() {
         });
         const data = await res.json();
         const edges = data.data?.projects?.edges || [];
+        for (const id of await auditIdsPromise) deletedProjectNamesOrIds.add(id);
+
+        // Phase 1 — per-project deployment state and per-service domains, fetched
+        // CONCURRENTLY. Both used to be awaited inside the row loop below, i.e.
+        // one Railway call after another at ~1s each; on a 32-account hub that
+        // alone was minutes of waiting before a new service could appear.
+        const liveNodes = edges
+          .map((e: any) => e?.node)
+          .filter((p: any) => p?.id && !p.deletedAt && !deletedProjectNamesOrIds.has(p.id));
+
+        const deploymentsByProject = new Map<string, Map<string, any>>();
+        await mapWithLimit(liveNodes, 6, async (p: any) => {
+          deploymentsByProject.set(p.id, await fetchLatestDeploymentsByService(token, p.id));
+        });
+
+        const domainsByService = new Map<string, any[]>();
+        const domainJobs: { projectId: string; serviceId: string; envId: string }[] = [];
+        for (const p of liveNodes) {
+          const envId = p.environments?.edges?.[0]?.node?.id || '';
+          for (const sEdge of p.services?.edges || []) {
+            const s = sEdge?.node;
+            if (s?.id) domainJobs.push({ projectId: p.id, serviceId: s.id, envId });
+          }
+        }
+        await mapWithLimit(domainJobs, 6, async (job) => {
+          domainsByService.set(
+            job.serviceId,
+            await fetchServiceDomains(token, job.projectId, job.serviceId, job.envId)
+          );
+        });
+
+        // Phase 2 — assemble the rows (no more network calls).
         for (const edge of edges) {
           const pNode = edge.node;
           if (!pNode || !pNode.id || projectMap.has(pNode.id)) continue;
@@ -665,7 +741,7 @@ async function startServer() {
           // and the deployment id restart/redeploy/stop act on).
           const latestDeployments = isDeleted
             ? new Map<string, any>()
-            : await fetchLatestDeploymentsByService(token, pNode.id);
+            : deploymentsByProject.get(pNode.id) || new Map<string, any>();
           const importedServices: any[] = [];
           if (pNode.services?.edges) {
             for (const sEdge of pNode.services.edges) {
@@ -673,9 +749,7 @@ async function startServer() {
               // Fetch real domains (with Railway ids) so the UI can list and
               // delete them — placeholders like `name.up.railway.app` are not
               // real and cannot be deleted.
-              const domains = isDeleted
-                ? []
-                : await fetchServiceDomains(token, pNode.id, sNode.id, defaultEnvId);
+              const domains = isDeleted ? [] : domainsByService.get(sNode.id) || [];
               const deployment = latestDeployments.get(sNode.id);
               importedServices.push({
                 id: sNode.id,
@@ -722,6 +796,12 @@ async function startServer() {
             isExternal: true,
             isDeletedOnRailway: isDeleted,
             deletedAt: pNode.deletedAt || (isDeleted ? new Date().toISOString() : undefined),
+            // Persistent disks (project.volumes) — Volume type exposes only
+            // id/name/createdAt/project/projectId, so nothing else is selectable.
+            volumes: (pNode.volumes?.edges || [])
+              .map((v: any) => v?.node)
+              .filter((v: any) => v?.id)
+              .map((v: any) => ({ id: v.id, name: v.name || '' })),
           });
         }
       }
@@ -733,6 +813,43 @@ async function startServer() {
   }
 
   // Validate Token & Extract Account Balance / Credit Limits Endpoint
+  // Railway RETURNS workspace.preferredRegion as a GCP-style slug
+  // (europe-west4-drams3a) but ACCEPTS the short code (ams). The region picker
+  // only knows short codes, so an unmapped slug matched no <option> and the
+  // select silently fell back to the first one — US East (Virginia) — while the
+  // real region was EU West. Map slug → code through Railway's own `regions`
+  // list (name = slug, id = short code), cached so validate/sync don't refetch.
+  const KNOWN_REGION_CODES = ['iad', 'pdx', 'sfo', 'ams', 'sin'];
+  let regionSlugCache: { at: number; map: Map<string, string> } | null = null;
+
+  async function resolveRegionCode(token: string, raw?: string | null): Promise<string | null> {
+    if (!raw) return null;
+    if (KNOWN_REGION_CODES.includes(raw)) return raw;
+    try {
+      if (!regionSlugCache || Date.now() - regionSlugCache.at > 10 * 60 * 1000) {
+        const res = await fetch('https://backboard.railway.app/graphql/v2', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token.trim()}`,
+          },
+          body: JSON.stringify({ query: 'query { regions { id name } }' }),
+        });
+        const data = await res.json();
+        const map = new Map<string, string>();
+        for (const r of data?.data?.regions || []) {
+          if (r?.name && r?.id) map.set(String(r.name), String(r.id));
+        }
+        regionSlugCache = { at: Date.now(), map };
+      }
+      // Unmapped slug: keep it as-is so the field never goes blank — the UI
+      // renders unknown values verbatim instead of a misleading default.
+      return regionSlugCache.map.get(raw) || raw;
+    } catch {
+      return raw;
+    }
+  }
+
   app.post('/api/railway/validate-token', async (req, res) => {
     try {
       const { token } = req.body;
@@ -841,7 +958,7 @@ async function startServer() {
           },
           extractedInfo: {
             workspaceId: workspace?.id || '',
-            preferredRegion: workspace?.preferredRegion ?? null,
+            preferredRegion: await resolveRegionCode(token, workspace?.preferredRegion),
             plan: isTrialing
               ? 'Trial'
               : planName === 'FREE' ? 'Free' : planName === 'HOBBY' ? 'Hobby' : 'Pro',
@@ -1052,7 +1169,7 @@ async function startServer() {
         creditUsed,
         creditRemaining,
         plan: ws?.plan ?? null,
-        preferredRegion: ws?.preferredRegion ?? null,
+        preferredRegion: await resolveRegionCode(token, ws?.preferredRegion),
       };
     } catch (err) {
       console.error('fetchPlanLimits failed', err);
@@ -1774,6 +1891,100 @@ async function startServer() {
     }
   });
 
+  // Manual source update — re-pull the CURRENT source instead of replaying the
+  // old deployment. Image sources (repo-less `xxx:latest`) get no push webhook,
+  // so Railway keeps the digest it resolved at deploy time forever; Git sources
+  // need `latestCommit` to move past the deployed commit. The mutation is picked
+  // from what the instance actually points at, never guessed on the client.
+  app.post('/api/railway/service/manual-update', async (req, res) => {
+    try {
+      const { token, projectId, serviceId, environmentId } = req.body;
+      if (!token || !projectId || !serviceId) {
+        return res.status(400).json({ error: 'token, projectId and serviceId are required' });
+      }
+
+      const authHeaders = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token.trim()}`,
+      };
+      const gqlUrl = 'https://backboard.railway.app/graphql/v2';
+
+      // environmentId is non-null on serviceInstance and both mutations, and a
+      // project synced without a default env would otherwise fail at the API.
+      let envId = environmentId;
+      if (!envId) {
+        const latest = await fetchLatestServiceDeployment(token, projectId, serviceId);
+        envId = latest?.environmentId;
+      }
+      if (!envId) {
+        return res.status(409).json({
+          error: 'محیط (environment) این سرویس مشخص نیست؛ ابتدا پروژه را همگام‌سازی کنید.',
+          code: 'NO_ENVIRONMENT',
+        });
+      }
+
+      // 1. Read-only: what does this instance deploy from?
+      const sourceRes = await fetch(gqlUrl, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          query: `
+            query GetServiceSource($serviceId: String!, $environmentId: String!) {
+              serviceInstance(serviceId: $serviceId, environmentId: $environmentId) {
+                source { repo image }
+              }
+            }
+          `,
+          variables: { serviceId, environmentId: envId },
+        }),
+      });
+      const sourceData = await sourceRes.json();
+      if (sourceData.errors) {
+        return res.status(sourceRes.status).json(sourceData);
+      }
+      const source = sourceData.data?.serviceInstance?.source || {};
+      if (!source.repo && !source.image) {
+        return res.status(409).json({
+          error:
+            'این سرویس از منبع خارجی (ریپو یا ایمیج) تغذیه نمی‌شود؛ منبع آپلوددستی فقط با railway up به‌روز می‌شود.',
+          code: 'NO_EXTERNAL_SOURCE',
+        });
+      }
+
+      // 2. Pick the mutation that actually resolves the source again.
+      const isRepo = !!source.repo;
+      const method = isRepo ? 'serviceInstanceDeploy' : 'serviceInstanceRedeploy';
+      const query = isRepo
+        ? `
+          mutation ManualUpdate($serviceId: String!, $environmentId: String!, $latestCommit: Boolean) {
+            serviceInstanceDeploy(serviceId: $serviceId, environmentId: $environmentId, latestCommit: $latestCommit)
+          }
+        `
+        : `
+          mutation ManualUpdate($serviceId: String!, $environmentId: String!) {
+            serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
+          }
+        `;
+      const variables: any = { serviceId, environmentId: envId };
+      if (isRepo) variables.latestCommit = true;
+
+      const updateRes = await fetch(gqlUrl, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ query, variables }),
+      });
+      const data = await updateRes.json();
+      return res.status(updateRes.status).json({
+        ...data,
+        method,
+        environmentId: envId,
+        source: { repo: source.repo || null, image: source.image || null },
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Manual source update failed' });
+    }
+  });
+
   // Stop a service's latest deployment (deploymentStop) — stops the running
   // container; deploymentRestart brings it back.
   app.post('/api/railway/service/stop', async (req, res) => {
@@ -2360,10 +2571,72 @@ async function startServer() {
   });
 
   // 6. Volume Create Proxy
+  //
+  // Railway answers a volumeCreate whose `region` is missing or doesn't match
+  // the service with a bare `Not Authorized` instead of a validation error, so
+  // the region is resolved HERE from the service itself rather than guessed.
+  // `environmentId` must be a real UUID — the old `'production'` fallback was
+  // an environment NAME and made the same call fail.
   app.post('/api/railway/volume/create', async (req, res) => {
     try {
-      const { token, projectId, environmentId, serviceId, mountPath = '/data', region = 'us-west1' } = req.body;
+      const { token, projectId, serviceId, mountPath = '/app/data', environmentId, region } = req.body;
       if (!token || !projectId || !serviceId) return res.status(400).json({ error: 'token, projectId, serviceId required' });
+
+      const authHeaders = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token.trim()}`,
+      };
+      const gqlUrl = 'https://backboard.railway.app/graphql/v2';
+
+      // 1. environment UUID: body, else the service's newest deployment.
+      let envId = environmentId;
+      if (!envId) {
+        const latest = await fetchLatestServiceDeployment(token, projectId, serviceId);
+        envId = latest?.environmentId;
+      }
+      if (!envId) {
+        return res.status(409).json({
+          error: 'محیط (environment) این سرویس مشخص نیست؛ ابتدا پروژه را همگام‌سازی کنید.',
+          code: 'NO_ENVIRONMENT',
+        });
+      }
+
+      // 2. Region: caller > serviceInstance.region > deploy manifest, all
+      //    normalized to Railway's short code (ams/iad/...) — the manifest
+      //    reports slugs (europe-west4-drams3a) that volumeCreate rejects.
+      let resolvedRegion = region ? await resolveRegionCode(token, region) : null;
+      if (!resolvedRegion) {
+        const regionRes = await fetch(gqlUrl, {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            query: `
+              query ServiceVolumeRegion($serviceId: String!, $environmentId: String!) {
+                serviceInstance(serviceId: $serviceId, environmentId: $environmentId) {
+                  region
+                  latestDeployment { meta }
+                }
+              }
+            `,
+            variables: { serviceId, environmentId: envId },
+          }),
+        });
+        const regionData = await regionRes.json();
+        if (regionData.errors) return res.status(regionRes.status).json(regionData);
+
+        const instance = regionData.data?.serviceInstance;
+        const manifestRegion = Object.keys(
+          instance?.latestDeployment?.meta?.serviceManifest?.deploy?.multiRegionConfig || {}
+        )[0];
+        resolvedRegion = await resolveRegionCode(token, instance?.region || manifestRegion);
+      }
+      if (!resolvedRegion) {
+        return res.status(409).json({
+          error:
+            'منطقه این سرویس مشخص نیست؛ سرویس باید یک‌بار دیپلوی شده باشد تا منطقه‌اش خوانده شود.',
+          code: 'NO_REGION',
+        });
+      }
 
       const query = `
         mutation CreateVolume($input: VolumeCreateInput!) {
@@ -2374,30 +2647,124 @@ async function startServer() {
         }
       `;
 
-      const response = await fetch('https://backboard.railway.app/graphql/v2', {
+      const response = await fetch(gqlUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token.trim()}`,
-        },
+        headers: authHeaders,
         body: JSON.stringify({
           query,
           variables: {
             input: {
               projectId,
-              environmentId: environmentId || 'production',
+              environmentId: envId,
               serviceId,
               mountPath,
-              region,
+              region: resolvedRegion,
             },
           },
         }),
       });
 
       const data = await response.json();
-      return res.status(response.status).json(data);
+      return res.status(response.status).json({
+        ...data,
+        region: resolvedRegion,
+        environmentId: envId,
+      });
     } catch (err: any) {
       return res.status(500).json({ error: err.message || 'Volume creation failed' });
+    }
+  });
+
+  // 6b. Volume Delete Proxy — schema is `volumeDelete(volumeId: String!)` (NOT
+  // `id`, as older notes claim). Deleting a volume erases everything on the
+  // disk, so the client must have confirmed before calling this.
+  app.post('/api/railway/volume/delete', async (req, res) => {
+    try {
+      const { token, volumeId } = req.body;
+      if (!token || !volumeId) {
+        return res.status(400).json({ error: 'token and volumeId are required' });
+      }
+
+      const query = `
+        mutation DeleteVolume($volumeId: String!) {
+          volumeDelete(volumeId: $volumeId)
+        }
+      `;
+
+      const response = await fetch('https://backboard.railway.app/graphql/v2', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token.trim()}`,
+        },
+        body: JSON.stringify({ query, variables: { volumeId } }),
+      });
+
+      const data = await response.json();
+      return res.status(response.status).json({ ...data, volumeId });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Volume deletion failed' });
+    }
+  });
+
+  // 6c. Volume instances for an environment — the ONLY account-token path that
+  // reports real volume status. `project.volumes` has no state at all (and
+  // keeps listing volumes already in the 48h soft-delete window), so this is
+  // what the UI must show: serviceId (attached?), isPendingDeletion/deletedAt
+  // (queued for purge), state, mountPath and size.
+  app.post('/api/railway/volume/instances', async (req, res) => {
+    try {
+      const { token, environmentId } = req.body;
+      if (!token || !environmentId) {
+        return res.status(400).json({ error: 'token and environmentId are required' });
+      }
+
+      const query = `
+        query EnvironmentVolumeInstances($id: String!) {
+          environment(id: $id) {
+            id
+            name
+            volumeInstances {
+              edges {
+                node {
+                  id
+                  state
+                  mountPath
+                  serviceId
+                  environmentId
+                  deletedAt
+                  isPendingDeletion
+                  currentSizeMB
+                  sizeMB
+                  region
+                  volume { id name }
+                }
+              }
+            }
+          }
+        }
+      `;
+
+      const response = await fetch('https://backboard.railway.app/graphql/v2', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token.trim()}`,
+        },
+        body: JSON.stringify({ query, variables: { id: environmentId } }),
+      });
+
+      const data = await response.json();
+      if (data.errors) return res.status(response.status).json(data);
+
+      const edges = data?.data?.environment?.volumeInstances?.edges || [];
+      const instances = edges
+        .map((e: any) => e?.node)
+        .filter((n: any) => n && (n.volume?.id || n.id));
+
+      return res.status(response.status).json({ ...data, instances });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Failed to fetch volume instances' });
     }
   });
 
@@ -2443,7 +2810,7 @@ async function startServer() {
 
   if (!isProduction) {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);

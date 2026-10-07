@@ -132,11 +132,23 @@ export async function loginAuth(
   return { success: false, error: await readError(res, 'نام کاربری یا رمز عبور اشتباه است') };
 }
 
-export async function resetAuth(): Promise<{ success: boolean; error?: string }> {
-  clearStoredToken();
-  const res = await apiFetch('/api/auth/reset', { method: 'POST' });
-  if (res.ok) return { success: true };
-  return { success: false, error: await readError(res, 'Failed to reset auth') };
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string
+): Promise<{ success: boolean; message?: string; error?: string }> {
+  const res = await apiFetch('/api/auth/change-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ currentPassword, newPassword }),
+  });
+  if (res.ok) {
+    const data = await res.json();
+    if (data.token) {
+      setStoredToken(data.token);
+    }
+    return { success: true, message: data.message || 'رمز عبور با موفقیت تغییر کرد' };
+  }
+  return { success: false, error: await readError(res, 'تغییر رمز عبور با خطا مواجه شد') };
 }
 
 export async function logoutAuth(): Promise<void> {

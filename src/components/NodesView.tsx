@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Server,
   Plus,
@@ -23,6 +23,7 @@ import {
   Check,
   Zap,
   Rocket,
+  DownloadCloud,
 } from 'lucide-react';
 import { useHub } from '../context/HubContext';
 import { RailwayService, RailwayProject, RailwayServiceDomain, domainLabel } from '../types';
@@ -37,6 +38,9 @@ import {
   updateRailwayServiceInstance,
   createRailwayVolume,
   createRailwayEnvironment,
+  getRailwayDeploymentLogs,
+  deleteRailwayVolume,
+  getRailwayVolumeInstances,
 } from '../services/railwayApi';
 import { extractApiError } from '../utils/githubRepo';
 import { ServiceIcon } from './ServiceIcon';
@@ -81,6 +85,41 @@ interface NodesViewProps {
   onOpenDeploy: () => void;
 }
 
+/** Status pill for one volume, from `environment.volumeInstances`.
+ *  `source: 'record'` means only `project.volumes` knew about it — no state. */
+function volumeStatusBadge(vol: any): { label: string; cls: string } {
+  if (vol?.source !== 'instance') {
+    return { label: 'وضعیت نامشخص', cls: 'border-neutral-600 bg-neutral-700/40 text-neutral-300' };
+  }
+  // Railway purges 48h after `deletedAt` is set — surface it before health.
+  if (vol.isPendingDeletion) {
+    return { label: 'در صف حذف', cls: 'border-amber-500/40 bg-amber-500/15 text-amber-300' };
+  }
+  if (vol.state && vol.state !== 'READY') {
+    return { label: vol.state, cls: 'border-rose-500/40 bg-rose-500/15 text-rose-300' };
+  }
+  return vol.serviceId
+    ? { label: 'متصل', cls: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' }
+    : { label: 'جدا شده', cls: 'border-sky-500/40 bg-sky-500/15 text-sky-300' };
+}
+
+/** Tailwind color for a Railway `deploymentLogs.severity` value. */
+function deployLogSeverityClass(severity?: string | null): string {
+  const s = (severity || '').toUpperCase();
+  if (s === 'ERROR' || s === 'CRITICAL' || s === 'FATAL') return 'text-rose-400';
+  if (s === 'WARN' || s === 'WARNING') return 'text-amber-400';
+  if (s === 'DEBUG') return 'text-neutral-500';
+  return 'text-emerald-400/90';
+}
+
+/** Railway sends log timestamps as ISO strings or epoch numbers — render both. */
+function deployLogTime(ts: any): string {
+  if (ts === null || ts === undefined || ts === '') return '';
+  const d = new Date(typeof ts === 'number' ? (ts < 1e12 ? ts * 1000 : ts) : ts);
+  if (Number.isNaN(d.getTime())) return String(ts);
+  return d.toLocaleTimeString('fa-IR');
+}
+
 export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
   const {
     accounts,
@@ -88,11 +127,14 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     allServices,
     restartService,
     redeployService,
+    updateSourceService,
     stopService,
     startService,
     deleteService,
     setActiveTab,
     addLog,
+    deletedVolumeIds,
+    markVolumeDeleted,
     sendCustomAlert,
     updateAccount,
     syncAccountProjects,
@@ -100,6 +142,8 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     deleteProject,
     deployJob,
     setDeployJob,
+    serviceDeployStates,
+    setServiceDeployState,
   } = useHub();
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -160,31 +204,81 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
   // 4. Volume Modal State
   const [selectedVolumeService, setSelectedVolumeService] = useState<RailwayService | null>(null);
-  const [mountPathInput, setMountPathInput] = useState('/data');
+  const [mountPathInput, setMountPathInput] = useState('/app/data');
   const [isCreatingVolume, setIsCreatingVolume] = useState(false);
+
+  // 5. Deploy Logs Modal State (real Railway deploymentLogs for one service)
+  const [selectedLogService, setSelectedLogService] = useState<RailwayService | null>(null);
+  const [deployLogs, setDeployLogs] = useState<any[]>([]);
+  const [isLoadingLogs, setIsLoadingLogs] = useState(false);
+  const [logsError, setLogsError] = useState<string | null>(null);
+  const logsScrollRef = useRef<HTMLDivElement>(null);
+
+  // 6. Project Volumes Modal State (list + volumeDelete)
+  const [volumeProjectId, setVolumeProjectId] = useState<string | null>(null);
+  const [confirmDeleteVolumeId, setConfirmDeleteVolumeId] = useState<string | null>(null);
+  const [isDeletingVolume, setIsDeletingVolume] = useState(false);
+  const [volumeError, setVolumeError] = useState<string | null>(null);
+  // Live status from environment.volumeInstances (null = not fetched yet).
+  const [volumeInstances, setVolumeInstances] = useState<any[] | null>(null);
+  const [isLoadingInstances, setIsLoadingInstances] = useState(false);
+  const [instancesError, setInstancesError] = useState<string | null>(null);
 
   // Target Account & Project
   const targetAccount = accounts.find((a) => a.id === activeAccountId) || accounts[0];
 
   // Aggregate Projects List — only real Railway projects (deleted, and any legacy
-// hub-local ones, are hidden).
+// hub-local ones, are hidden). Volumes this app already removed are filtered
+  // here (single choke point) because Railway's `project.volumes` keeps
+  // returning them after a successful volumeDelete.
   const allProjects = useMemo(() => {
     const list: RailwayProject[] = [];
     accounts.forEach((acc) => {
       if (activeAccountId === 'all' || acc.id === activeAccountId) {
         acc.projects.forEach((p) => {
-          if (!p.isDeletedOnRailway && p.isExternal) list.push(p);
+          if (!p.isDeletedOnRailway && p.isExternal) {
+            list.push(
+              p.volumes && p.volumes.length > 0
+                ? { ...p, volumes: p.volumes.filter((v) => !deletedVolumeIds.includes(v.id)) }
+                : p
+            );
+          }
         });
       }
     });
     return list;
-  }, [accounts, activeAccountId]);
+  }, [accounts, activeAccountId, deletedVolumeIds]);
 
   // Active Selected Project Object
   const selectedProject = useMemo(() => {
     if (selectedProjectId === 'all') return null;
     return allProjects.find((p) => p.id === selectedProjectId) || null;
   }, [allProjects, selectedProjectId]);
+
+  // Resolved live from state (not a snapshot) so the volume list drops a disk
+  // as soon as the post-delete sync returns.
+  const volumeProject = useMemo(
+    () => (volumeProjectId ? allProjects.find((p) => p.id === volumeProjectId) || null : null),
+    [allProjects, volumeProjectId]
+  );
+
+  /** Rows for the modal: live instances (status, mount, size) plus any bare
+   *  record `project.volumes` still reports. Volumes this app deleted are
+   *  filtered out — Railway keeps returning them for the 48h purge window. */
+  const volumeRows = useMemo(() => {
+    if (!volumeProject) return [];
+    const rows = new Map<string, any>();
+    for (const inst of volumeInstances || []) {
+      const id = inst?.volume?.id || inst?.id;
+      if (!id || deletedVolumeIds.includes(id)) continue;
+      rows.set(id, { id, name: inst.volume?.name || '', source: 'instance', ...inst });
+    }
+    for (const rec of volumeProject.volumes || []) {
+      if (rows.has(rec.id)) continue;
+      rows.set(rec.id, { id: rec.id, name: rec.name, source: 'record' });
+    }
+    return Array.from(rows.values());
+  }, [volumeProject, volumeInstances, deletedVolumeIds]);
 
   // The "all projects" option was removed — always keep exactly one project
   // selected (auto-selects the first one when the list changes).
@@ -365,6 +459,60 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     }
     return '';
   };
+
+  /** The account that OWNS a service — Railway rejects a token from another
+   *  account, so never fall back to the globally selected one silently. */
+  const accountForService = (service: RailwayService) =>
+    accounts.find((a) => a.id === service.accountId) || targetAccount;
+
+  /** Pulls real build/run logs for a service's latest deployment. */
+  const loadDeployLogs = async (service: RailwayService) => {
+    const acc = accountForService(service);
+    if (!acc?.token) {
+      setDeployLogs([]);
+      setLogsError('توکن ریلوی برای اکانت این سرویس ثبت نشده است.');
+      setIsLoadingLogs(false);
+      return;
+    }
+    if (!service.latestDeploymentId) {
+      setDeployLogs([]);
+      setLogsError('هنوز استقراری برای این سرویس روی ریلوی ثبت نشده است.');
+      setIsLoadingLogs(false);
+      return;
+    }
+
+    setIsLoadingLogs(true);
+    setLogsError(null);
+    try {
+      const res = await getRailwayDeploymentLogs({
+        token: acc.token,
+        deploymentId: service.latestDeploymentId,
+        limit: 200,
+      });
+      const err = extractApiError(res, '');
+      if (err) throw new Error(err);
+      const list = res?.data?.deploymentLogs;
+      setDeployLogs(Array.isArray(list) ? list : []);
+    } catch (e: any) {
+      setDeployLogs([]);
+      setLogsError(e.message || 'دریافت لاگ از ریلوی ناموفق بود.');
+    } finally {
+      setIsLoadingLogs(false);
+    }
+  };
+
+  const openDeployLogs = async (service: RailwayService) => {
+    setSelectedLogService(service);
+    setDeployLogs([]);
+    setLogsError(null);
+    await loadDeployLogs(service);
+  };
+
+  // Keep the newest log line in view once a fetch lands.
+  useEffect(() => {
+    if (isLoadingLogs) return;
+    logsScrollRef.current?.scrollTo({ top: logsScrollRef.current.scrollHeight });
+  }, [deployLogs, isLoadingLogs]);
 
   /** Writes a domains array onto a service in local hub state. */
   const applyServiceDomains = (serviceId: string, domains: RailwayServiceDomain[]) => {
@@ -559,8 +707,10 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     setSelectedBuildConfigService(null);
   };
 
-  // Handle Persistent Volume Creation (volumeCreate) — region is not user-
-  // configurable; Railway picks it with the project.
+  // Handle Persistent Volume Creation (volumeCreate). Region is NOT guessed
+  // here: Railway requires a region that matches the service and answers a
+  // wrong/missing one with a bare `Not Authorized`, so the server resolves it
+  // from the service's own deployment. Only the environment UUID is needed.
   const handleCreateVolumeSubmit = async () => {
     if (!selectedVolumeService || !targetAccount) return;
     setIsCreatingVolume(true);
@@ -568,6 +718,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     const res = await createRailwayVolume({
       token: targetAccount.token,
       projectId: selectedVolumeService.projectId,
+      environmentId: resolveServiceEnvId(selectedVolumeService) || undefined,
       serviceId: selectedVolumeService.id,
       mountPath: mountPathInput,
     });
@@ -578,14 +729,96 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
       return;
     }
 
+    const region = res?.region ? ` in region ${res.region}` : '';
     addLog({
       level: 'info',
       serviceName: selectedVolumeService.name,
-      message: `[VOLUME_CREATED] Persistent disk mounted at ${mountPathInput}.`,
+      message: `[VOLUME_CREATED] Persistent disk mounted at ${mountPathInput}${region}.`,
     });
 
     setIsCreatingVolume(false);
     setSelectedVolumeService(null);
+  };
+
+  // Handle Volume Deletion (volumeDelete) — erases everything on the disk, so
+  // the caller (the row) only reaches this after a second confirming click.
+  /** Live volume status (state / attached / pending deletion) from the
+   *  environment — `project.volumes` reports none of it. */
+  const loadVolumeInstances = async (project: RailwayProject) => {
+    const acc = accounts.find((a) => a.id === project.accountId) || targetAccount;
+    if (!acc?.token) {
+      setVolumeInstances(null);
+      setInstancesError('توکن ریلوی برای اکانت این پروژه ثبت نشده است.');
+      return;
+    }
+    if (!project.defaultEnvironmentId) {
+      setVolumeInstances(null);
+      setInstancesError('محیط این پروژه مشخص نیست؛ وضعیت Volume قابل خواندن نیست.');
+      return;
+    }
+
+    setIsLoadingInstances(true);
+    setInstancesError(null);
+    try {
+      const res = await getRailwayVolumeInstances({
+        token: acc.token,
+        environmentId: project.defaultEnvironmentId,
+      });
+      const err = extractApiError(res, '');
+      if (err) throw new Error(err);
+      setVolumeInstances(Array.isArray(res.instances) ? res.instances : []);
+    } catch (e: any) {
+      setVolumeInstances(null);
+      setInstancesError(e.message || 'دریافت وضعیت Volume از ریلوی ناموفق بود.');
+    } finally {
+      setIsLoadingInstances(false);
+    }
+  };
+
+  const openVolumeModal = (project: RailwayProject) => {
+    setVolumeProjectId(project.id);
+    setVolumeError(null);
+    setConfirmDeleteVolumeId(null);
+    setInstancesError(null);
+    setVolumeInstances(null);
+    void loadVolumeInstances(project);
+  };
+
+  const handleDeleteVolume = async (volumeId: string) => {
+    if (!volumeProject) return;
+    const acc = accounts.find((a) => a.id === volumeProject.accountId) || targetAccount;
+    if (!acc?.token) {
+      setVolumeError('توکن ریلوی برای اکانت این پروژه ثبت نشده است.');
+      return;
+    }
+
+    setIsDeletingVolume(true);
+    setVolumeError(null);
+    try {
+      const res = await deleteRailwayVolume({ token: acc.token, volumeId });
+      const err = extractApiError(res, '');
+      if (err) throw new Error(err);
+      if (res?.data?.volumeDelete !== true) throw new Error('ریلوی حذف Volume را نپذیرفت.');
+
+      // Railway keeps returning the volume from `project.volumes` after a
+      // successful delete, so remember it here or the next sync brings it back.
+      markVolumeDeleted(volumeId);
+
+      addLog({
+        level: 'info',
+        serviceName: volumeProject.name,
+        message: `[VOLUME_DELETED] Volume ${volumeId} deleted — its data is gone.`,
+      });
+      flashCardToast('ok', 'Volume روی ریلوی حذف شد.');
+      await syncAccountProjects(acc.id);
+    } catch (e: any) {
+      const message = e.message || 'حذف Volume روی ریلوی انجام نشد.';
+      setVolumeError(message);
+      flashCardToast('error', message);
+    } finally {
+      setIsDeletingVolume(false);
+      setConfirmDeleteVolumeId(null);
+    }
   };
 
   return (
@@ -643,6 +876,19 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
               <span className={`text-[9px] px-1.5 py-0.2 rounded font-semibold ${isSelected ? 'bg-white/20 text-white' : 'bg-sky-500/15 text-sky-300 border border-sky-500/25'}`}>
                 از ریلوی
               </span>
+              {proj.volumes && proj.volumes.length > 0 && (
+                <span
+                  className={`flex items-center gap-0.5 rounded-full px-1.5 py-0.2 text-[9px] font-semibold border ${
+                    isSelected
+                      ? 'bg-white/15 text-white border-white/25'
+                      : 'bg-amber-500/15 text-amber-300 border-amber-500/25'
+                  }`}
+                  title={`Volume ها: ${proj.volumes.map((v) => v.name).join('، ')}`}
+                >
+                  <HardDrive className="h-2.5 w-2.5" />
+                  {proj.volumes.length}
+                </span>
+              )}
               <span className="rounded-full bg-neutral-950/40 px-1.5 py-0.2 text-[10px] font-mono">
                 {proj.services?.length || 0}
               </span>
@@ -667,11 +913,32 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
               </div>
               <p className="text-xs text-neutral-400 truncate mt-0.5">
                 {selectedProject.description || 'بدون توضیحات'} • {selectedProject.services?.length || 0} سرویس فعال
+                {(selectedProject.volumes?.length || 0) > 0 && (
+                  <span
+                    className="text-amber-300/90"
+                    title={selectedProject.volumes!.map((v) => v.name).join('، ')}
+                  >
+                    {' '}
+                    • {selectedProject.volumes!.length} Volume
+                  </span>
+                )}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto justify-end">
+            <button
+              onClick={() => openVolumeModal(selectedProject)}
+              className="flex items-center gap-1.5 rounded-xl bg-sky-500/10 border border-sky-500/30 px-3 py-1.5 text-xs font-semibold text-sky-300 hover:bg-sky-500/20 transition"
+              title="مدیریت Volume های این پروژه (project.volumes / volumeDelete)"
+            >
+              <HardDrive className="h-3.5 w-3.5" />
+              <span>
+                Volume‌ها
+                {(selectedProject.volumes?.length || 0) > 0 ? ` (${selectedProject.volumes!.length})` : ''}
+              </span>
+            </button>
+
             <button
               onClick={onOpenDeploy}
               className="flex items-center gap-1.5 rounded-xl bg-purple-600/30 border border-purple-500/40 px-3 py-1.5 text-xs font-semibold text-purple-200 hover:bg-purple-600/50 transition"
@@ -813,46 +1080,53 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                     {srv.deploymentStatusAt && <span>· {railTimeAgo(srv.deploymentStatusAt)}</span>}
                   </div>
 
-                  {/* Live deploy-job strip for THIS service (stays after modal closes) */}
-                  {deployJob?.serviceId === srv.id && (
-                    <div
-                      className={`mb-2 flex items-center gap-1.5 rounded-xl border px-2 py-1.5 text-[10px] ${
-                        deployJob.status === 'running'
-                          ? 'bg-sky-500/10 border-sky-500/30 text-sky-300'
-                          : deployJob.status === 'success'
-                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
-                            : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
-                      }`}
-                    >
-                      {deployJob.status === 'running' ? (
-                        <RotateCw className="h-3 w-3 shrink-0 animate-spin" />
-                      ) : deployJob.status === 'success' ? (
-                        <CheckCircle2 className="h-3 w-3 shrink-0" />
-                      ) : (
-                        <AlertTriangle className="h-3 w-3 shrink-0" />
-                      )}
-                      <span className="truncate flex-1" title={deployJob.phase}>
-                        {deployJob.phase}
-                      </span>
-                      {deployJob.status === 'success' && deployJob.domain && (
-                        <a
-                          href={`https://${deployJob.domain}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="font-mono text-[9px] underline underline-offset-2 shrink-0 hover:text-emerald-200"
-                        >
-                          دامنه
-                        </a>
-                      )}
-                      <button
-                        onClick={() => setDeployJob(null)}
-                        className="shrink-0 rounded p-0.5 hover:bg-white/10 transition"
-                        title="بستن"
+                  {/* Live deploy-job strip for THIS service (independent of header banner, survives refresh/tab switch) */}
+                  {(() => {
+                    const cardState = serviceDeployStates[srv.id] || (deployJob?.serviceId === srv.id ? deployJob : null);
+                    if (!cardState) return null;
+                    return (
+                      <div
+                        className={`mb-2.5 flex items-center gap-2 rounded-xl border px-2.5 py-1.5 text-xs font-medium ${
+                          cardState.status === 'running'
+                            ? 'bg-sky-500/10 border-sky-500/30 text-sky-300'
+                            : cardState.status === 'success'
+                              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                              : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                        }`}
                       >
-                        <X className="h-3 w-3" />
-                      </button>
-                    </div>
-                  )}
+                        {cardState.status === 'running' ? (
+                          <RotateCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                        ) : cardState.status === 'success' ? (
+                          <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                        ) : (
+                          <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+                        )}
+                        <span className="truncate flex-1 font-mono text-[11px]" title={cardState.phase}>
+                          {cardState.phase}
+                        </span>
+                        {cardState.domain && (
+                          <a
+                            href={`https://${cardState.domain}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="font-mono text-[9px] bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 rounded-lg text-emerald-200 shrink-0 hover:bg-emerald-500/30 transition"
+                          >
+                            دامنه
+                          </a>
+                        )}
+                        <button
+                          onClick={() => {
+                            setServiceDeployState(srv.id, null);
+                            if (deployJob?.serviceId === srv.id) setDeployJob(null);
+                          }}
+                          title="بستن اعلان دیپلوی"
+                          className="shrink-0 rounded-md p-0.5 text-current opacity-50 hover:opacity-100 transition"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })()}
 
                   {/* Title & Domain */}
                   <div className="flex items-start gap-2.5 mb-3">
@@ -947,6 +1221,13 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                     >
                       <HardDrive className="h-3.5 w-3.5" />
                     </button>
+                    <button
+                      onClick={() => openDeployLogs(srv)}
+                      className="rounded-lg border border-neutral-800 bg-neutral-950 p-1.5 text-neutral-400 hover:text-emerald-400 hover:border-emerald-500/30 transition"
+                      title="لاگ‌های دیپلوی این سرویس (deploymentLogs)"
+                    >
+                      <Terminal className="h-3.5 w-3.5" />
+                    </button>
                   </div>
 
                   <div className="flex items-center gap-1">
@@ -963,6 +1244,15 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                       title="دیپلوی مجدد (deploymentRedeploy)"
                     >
                       <Rocket className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      onClick={() =>
+                        runCardAction(srv, updateSourceService, 'آپدیت از آخرین سورس در ریلوی صف شد.')
+                      }
+                      className="rounded-lg border border-neutral-800 bg-neutral-950 p-1.5 text-neutral-400 hover:text-emerald-400 hover:border-emerald-500/30 transition"
+                      title="آپدیت دستی از آخرین سورس (ایمیج: serviceInstanceRedeploy · ریپو: serviceInstanceDeploy + latestCommit)"
+                    >
+                      <DownloadCloud className="h-3.5 w-3.5" />
                     </button>
 
                     {isHealthy ? (
@@ -1394,9 +1684,14 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                   type="text"
                   value={mountPathInput}
                   onChange={(e) => setMountPathInput(e.target.value)}
-                  placeholder="/data"
+                  placeholder="/app/data"
                   className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-white focus:border-purple-500 focus:outline-none"
                 />
+                <p className="text-[10px] text-neutral-500 mt-1">
+                  پیش‌فرض <span className="font-mono text-neutral-400">/app/data</span> — باید با مسیری که اپ
+                  رویش می‌نویسد یکی باشد (مثلاً <span className="font-mono text-neutral-400">/data</span> یا{' '}
+                  <span className="font-mono text-neutral-400">/var/lib/app</span>).
+                </p>
               </div>
 
               <div className="flex justify-end gap-2 pt-2 border-t border-neutral-800">
@@ -1414,6 +1709,249 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                   ایجاد دیسک Volume
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 5. Deploy Logs Modal (deploymentLogs) */}
+      {selectedLogService && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+          <div className="w-[94vw] max-w-3xl rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-5 shadow-2xl flex flex-col max-h-[85vh]">
+            <div className="flex items-center justify-between gap-2 border-b border-neutral-800 pb-3 mb-3">
+              <div className="flex items-center gap-2 min-w-0">
+                <Terminal className="h-5 w-5 text-emerald-400 shrink-0" />
+                <div className="min-w-0">
+                  <h3 className="text-sm font-bold text-white truncate">
+                    لاگ‌های دیپلوی {selectedLogService.name}
+                  </h3>
+                  <p className="text-[10px] text-neutral-500 font-mono truncate" dir="ltr">
+                    {selectedLogService.latestDeploymentId || 'no deployment'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span
+                  className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${railStatusColor(selectedLogService)}`}
+                >
+                  {selectedLogService.deploymentStatus || 'نامشخص'}
+                </span>
+                <button
+                  onClick={() => loadDeployLogs(selectedLogService)}
+                  disabled={isLoadingLogs}
+                  title="تازه‌سازی لاگ"
+                  className="rounded-lg border border-neutral-800 p-1.5 text-neutral-400 hover:text-white hover:border-neutral-700 transition disabled:opacity-50"
+                >
+                  <RotateCw className={`h-3.5 w-3.5 ${isLoadingLogs ? 'animate-spin' : ''}`} />
+                </button>
+                <button
+                  onClick={() => setSelectedLogService(null)}
+                  title="بستن"
+                  className="rounded-lg border border-neutral-800 p-1.5 text-neutral-400 hover:text-white hover:border-neutral-700 transition"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+
+            <div
+              ref={logsScrollRef}
+              className="flex-1 min-h-0 overflow-y-auto rounded-2xl border border-neutral-800 bg-neutral-950 p-3 font-mono text-[11px] space-y-1"
+            >
+              {isLoadingLogs ? (
+                <div className="py-10 text-center text-xs text-neutral-400">
+                  در حال دریافت لاگ از ریلوی...
+                </div>
+              ) : logsError ? (
+                <div className="py-10 text-center text-xs text-amber-400/90 px-4 leading-relaxed">
+                  {logsError}
+                </div>
+              ) : deployLogs.length === 0 ? (
+                <div className="py-10 text-center text-xs text-neutral-500">
+                  لاگی برای این استقرار برگردانده نشد.
+                </div>
+              ) : (
+                deployLogs.map((log: any, i: number) => (
+                  <div key={i} className="flex items-start gap-2 leading-relaxed">
+                    <span className="shrink-0 select-none text-neutral-600 tabular-nums">
+                      {deployLogTime(log?.timestamp)}
+                    </span>
+                    <span
+                      className={`w-[54px] shrink-0 text-[9px] font-bold uppercase pt-[3px] ${deployLogSeverityClass(
+                        log?.severity
+                      )}`}
+                    >
+                      {log?.severity || ''}
+                    </span>
+                    <span className="min-w-0 whitespace-pre-wrap break-all text-neutral-300">
+                      {log?.message ?? ''}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 7. Project Volumes Modal (project.volumes + volumeDelete) */}
+      {volumeProject && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+          <div className="w-[92vw] max-w-lg rounded-3xl border border-neutral-800 bg-neutral-900 p-5 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-3">
+              <div className="flex items-center gap-2 min-w-0">
+                <HardDrive className="h-5 w-5 text-sky-400 shrink-0" />
+                <div className="min-w-0">
+                  <h3 className="text-sm font-bold text-white truncate">
+                    Volume های {volumeProject.name}
+                  </h3>
+                  <p className="text-[10px] text-neutral-500 truncate">
+                    حذف Volume = پاک شدن کل داده‌های روی دیسک
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={async () => {
+                  if (volumeProject) await loadVolumeInstances(volumeProject);
+                  const acc = accounts.find((a) => a.id === volumeProject.accountId) || targetAccount;
+                  if (acc) await syncAccountProjects(acc.id);
+                }}
+                title="تازه‌سازی وضعیت Volume از ریلوی"
+                className="rounded-xl border border-neutral-800 p-1 text-neutral-400 hover:text-white"
+              >
+                <RotateCw className={`h-4 w-4 ${isLoadingInstances ? 'animate-spin' : ''}`} />
+              </button>
+              <button
+                onClick={() => setVolumeProjectId(null)}
+                className="rounded-xl border border-neutral-800 p-1 text-neutral-400 hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {volumeError && (
+              <div className="mb-3 rounded-xl border border-rose-500/30 bg-rose-950/60 px-3 py-2 text-[11px] text-rose-300">
+                {volumeError}
+              </div>
+            )}
+
+            {instancesError && (
+              <div className="mb-3 rounded-xl border border-amber-500/30 bg-amber-950/60 px-3 py-2 text-[11px] text-amber-300">
+                {instancesError} — وضعیت از روی لیست پروژه نمایش داده می‌شود.
+              </div>
+            )}
+
+            {isLoadingInstances && volumeRows.length === 0 ? (
+              <div className="rounded-2xl border border-neutral-800 bg-neutral-950 px-4 py-8 text-center text-xs text-neutral-400">
+                در حال دریافت وضعیت Volume از ریلوی...
+              </div>
+            ) : volumeRows.length === 0 ? (
+              <div className="rounded-2xl border border-neutral-800 bg-neutral-950 px-4 py-8 text-center text-xs text-neutral-500">
+                Volume فعالی در این پروژه نیست.
+              </div>
+            ) : (
+              <>
+                {volumeRows.some((r) => r.isPendingDeletion) && (
+                  <div className="mb-2 rounded-xl border border-amber-500/25 bg-amber-950/40 px-3 py-2 text-[10px] leading-relaxed text-amber-300/90">
+                    ریلوی حذف را نرم انجام می‌دهد: رکوردِ حذف‌شده تا ۴۸ ساعت دیده می‌شود و بعد از تاریخ
+                    مندرج برای همیشه پاک می‌شود.
+                  </div>
+                )}
+
+                <div className="space-y-2 max-h-[50vh] overflow-y-auto pr-0.5">
+                  {volumeRows.map((vol) => {
+                    const isConfirming = confirmDeleteVolumeId === vol.id;
+                    const pending = !!vol.isPendingDeletion;
+                    const badge = volumeStatusBadge(vol);
+                    const purgeDate = pending && vol.deletedAt
+                      ? new Date(vol.deletedAt).toLocaleDateString('fa-IR')
+                      : null;
+                    return (
+                      <div
+                        key={vol.id}
+                        className="rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-xs font-bold text-white truncate">{vol.name}</span>
+                              <span
+                                className={`shrink-0 rounded border px-1.5 py-px text-[9px] font-semibold ${badge.cls}`}
+                              >
+                                {badge.label}
+                              </span>
+                            </div>
+                            <div className="truncate text-[10px] text-neutral-500 font-mono" dir="ltr">
+                              {vol.id}
+                            </div>
+                          </div>
+
+                          <button
+                            onClick={() => {
+                              // First click arms the confirm; second (within 3s) deletes.
+                              if (isConfirming) {
+                                void handleDeleteVolume(vol.id);
+                                return;
+                              }
+                              setConfirmDeleteVolumeId(vol.id);
+                              setTimeout(
+                                () => setConfirmDeleteVolumeId((cur) => (cur === vol.id ? null : cur)),
+                                3000
+                              );
+                            }}
+                            disabled={isDeletingVolume || pending}
+                            className={
+                              isConfirming
+                                ? 'shrink-0 rounded-lg border border-rose-500 bg-rose-500/20 px-2.5 py-1.5 text-[11px] font-bold text-rose-300 animate-pulse'
+                                : 'shrink-0 rounded-lg border border-neutral-800 px-2 py-1.5 text-neutral-400 hover:border-rose-500/40 hover:text-rose-400 transition disabled:opacity-40'
+                            }
+                            title={
+                              pending
+                                ? 'قبلاً در صف حذف است — تا ۴۸ ساعت دیگر پاک می‌شود'
+                                : isConfirming
+                                  ? 'کلیک دوباره = حذف قطعی Volume و همه داده‌هایش'
+                                  : 'حذف Volume (volumeDelete)'
+                            }
+                          >
+                            {isConfirming ? (
+                              'حذف قطعی؟'
+                            ) : isDeletingVolume ? (
+                              <RotateCw className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+                        </div>
+
+                        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-neutral-500">
+                          {vol.mountPath && (
+                            <span className="font-mono" dir="ltr">
+                              {vol.mountPath}
+                            </span>
+                          )}
+                          {typeof vol.sizeMB === 'number' && (
+                            <span className="font-mono" dir="ltr">
+                              {vol.currentSizeMB ?? 0}MB / {vol.sizeMB}MB
+                            </span>
+                          )}
+                          {vol.region && <span dir="ltr">{vol.region}</span>}
+                          {purgeDate && <span>حذف نهایی: {purgeDate}</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+
+            <div className="mt-4 flex justify-end border-t border-neutral-800 pt-3">
+              <button
+                onClick={() => setVolumeProjectId(null)}
+                className="rounded-xl border border-neutral-800 px-3.5 py-1.5 text-xs text-neutral-400 hover:text-white"
+              >
+                بستن
+              </button>
             </div>
           </div>
         </div>

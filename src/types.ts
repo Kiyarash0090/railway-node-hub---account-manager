@@ -41,7 +41,7 @@ export interface RailwayService {
   accountId: string;
   name: string;
   icon: string;
-  templateType: 'nodejs' | 'python' | 'telegram-bot' | 'nextjs' | 'postgres' | 'redis' | 'docker' | 'custom';
+  templateType: 'docker' | 'custom';
   imageOrRepo: string;
   status: ServiceStatus;
   cpuUsage: number; // percentage e.g. 14.5
@@ -77,6 +77,8 @@ export interface RailwayProject {
   isExternal?: boolean;
   isDeletedOnRailway?: boolean;
   services: RailwayService[];
+  /** Persistent disks attached to the project (Railway `project.volumes`). */
+  volumes?: { id: string; name: string }[];
   createdAt: string;
   updatedAt: string;
 }
@@ -96,11 +98,6 @@ export interface RailwayAccount {
   hourlyBurnRate: number; // e.g. 0.008
   status: AccountStatus;
   lastChecked: string;
-  // Budget Guard / Auto-Shutdown Settings
-  autoShutdownEnabled: boolean;
-  autoShutdownThreshold: number; // e.g. $0.50 (if remaining < this, shutdown)
-  isShutdownTriggered: boolean;
-  shutdownTriggeredAt?: string;
   projects: RailwayProject[];
   isRealVerified?: boolean;
   // Plan limits reported live by Railway (Free = 1 project, Trial/Hobby = more)

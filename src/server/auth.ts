@@ -195,7 +195,8 @@ function clearSession(req: Request, res: Response): void {
 
 export function mountAuthRoutes(app: Express): void {
   app.get('/api/auth/status', (req, res) => {
-    const setupRequired = readCredentials() === null;
+    const cred = readCredentials();
+    const setupRequired = cred === null;
     const user = getSessionUser(req);
     const authenticated = user !== null;
     res.json({
@@ -259,19 +260,48 @@ export function mountAuthRoutes(app: Express): void {
     res.json({ success: true, username: cred.username, token });
   });
 
-  app.post('/api/auth/reset', (req, res) => {
-    try {
-      const file = authFilePath();
-      if (fs.existsSync(file)) {
-        fs.unlinkSync(file);
-      }
-      sessions.clear();
-      revokedTokens.clear();
-      clearSession(req, res);
-      res.json({ success: true, message: 'حساب کاربری بازنشانی شد' });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'خطا در بازنشانی حساب' });
+  // Authenticated Change Password Endpoint
+  app.post('/api/auth/change-password', (req, res) => {
+    const user = getSessionUser(req);
+    if (!user) {
+      return res.status(401).json({ error: 'برای تغییر رمز عبور ابتدا باید وارد حساب کاربری شوید' });
     }
+
+    const cred = readCredentials();
+    if (!cred) {
+      return res.status(400).json({ error: 'حسابی تعریف نشده است' });
+    }
+
+    const { currentPassword, newPassword } = req.body || {};
+    if (typeof currentPassword !== 'string' || !verifyPassword(currentPassword, cred)) {
+      return res.status(400).json({ error: 'رمز عبور فعلی اشتباه است' });
+    }
+
+    if (typeof newPassword !== 'string' || newPassword.length < 6) {
+      return res.status(400).json({ error: 'رمز عبور جدید باید حداقل ۶ کاراکتر باشد' });
+    }
+
+    const salt = randomBytes(16).toString('hex');
+    const updatedCred: Credentials = {
+      username: cred.username,
+      passwordHash: hashPassword(newPassword, salt),
+      salt,
+      createdAt: cred.createdAt,
+    };
+
+    const file = authFilePath();
+    try {
+      fs.writeFileSync(file, JSON.stringify(updatedCred, null, 2), { mode: 0o600 });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'ذخیره رمز عبور جدید با خطا مواجه شد' });
+    }
+
+    // Revoke old session token and issue a fresh signed token
+    const oldToken = extractAuthToken(req);
+    if (oldToken) revokeToken(oldToken);
+
+    const token = startSession(res, updatedCred.username, req);
+    res.json({ success: true, message: 'رمز عبور با موفقیت بروزرسانی شد', token });
   });
 
   app.post('/api/auth/logout', (req, res) => {

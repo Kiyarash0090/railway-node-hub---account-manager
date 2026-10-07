@@ -9,8 +9,8 @@ import {
   MetricDataPoint,
   ServiceStatus,
 } from '../types';
-import { INITIAL_ACCOUNTS, INITIAL_LOGS, TEMPLATES } from '../constants/initialData';
-import { validateRailwayToken, syncRailwayProjects, deleteRailwayProject, restartRailwayService, redeployRailwayService, stopRailwayService, deleteRailwayService, getRailwayServiceMetrics } from '../services/railwayApi';
+import { INITIAL_ACCOUNTS, INITIAL_LOGS } from '../constants/initialData';
+import { validateRailwayToken, syncRailwayProjects, deleteRailwayProject, restartRailwayService, redeployRailwayService, manualUpdateRailwayService, stopRailwayService, deleteRailwayService, getRailwayServiceMetrics } from '../services/railwayApi';
 import { extractApiError } from '../utils/githubRepo';
 import { apiFetch as fetch } from '../services/authApi';
 
@@ -20,8 +20,39 @@ export interface DeployJobState {
   phase: string;
   repo?: string;
   domain?: string;
-  /** Railway serviceId the job is about — lets the service card show its own status strip. */
+  /** Railway serviceId the job is about. */
   serviceId?: string;
+  /** Stamped by setDeployJob — used to expire banners that can no longer update. */
+  updatedAt?: number;
+}
+
+export interface ServiceDeployState {
+  status: 'running' | 'success' | 'error';
+  phase: string;
+  domain?: string;
+  updatedAt?: number;
+}
+
+/** True once Railway's deployment for this service has reached a final state —
+ *  any "still building" marker for it is stale by definition. */
+function isDeploymentSettled(srv: RailwayService): boolean {
+  if (srv.deploymentStopped) return true;
+  const status = (srv.deploymentStatus || '').toUpperCase();
+  return status === 'SUCCESS' || status === 'FAILED' || status === 'CRASHED' || status === 'REMOVED';
+}
+
+/** Runs `fn` over `items` with at most `limit` in flight (used to sync accounts
+ *  concurrently instead of one Railway-slow call after another). */
+async function runWithConcurrency<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) break;
+      await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
 }
 
 interface HubContextType {
@@ -32,14 +63,16 @@ interface HubContextType {
   logs: LogEntry[];
   isStreamingLogs: boolean;
   isSyncingProjects: boolean;
-  activeTab: 'dashboard' | 'accounts' | 'nodes' | 'logs' | 'metrics' | 'alerts';
+  activeTab: 'dashboard' | 'accounts' | 'nodes' | 'metrics' | 'alerts';
   theme: 'dark' | 'light';
   deployJob: DeployJobState | null;
   setDeployJob: React.Dispatch<React.SetStateAction<DeployJobState | null>>;
+  serviceDeployStates: Record<string, ServiceDeployState>;
+  setServiceDeployState: (serviceId: string, state: ServiceDeployState | null) => void;
 
   // Account Actions
   setActiveAccountId: (id: string) => void;
-  setActiveTab: (tab: 'dashboard' | 'accounts' | 'nodes' | 'logs' | 'metrics' | 'alerts') => void;
+  setActiveTab: (tab: 'dashboard' | 'accounts' | 'nodes' | 'metrics' | 'alerts') => void;
   toggleTheme: () => void;
   syncAccountProjects: (accountId?: string) => Promise<void>;
   addAccount: (accountData: {
@@ -47,18 +80,12 @@ interface HubContextType {
     token: string;
     color?: string;
     creditLimit?: number;
-    autoShutdownThreshold?: number;
     email?: string;
   }) => Promise<{ success: boolean; error?: string }>;
   updateAccount: (id: string, updates: Partial<RailwayAccount>) => void;
   deleteAccount: (id: string) => void;
   deleteProject: (accountId: string, projectId: string) => Promise<{ success: boolean; error?: string }>;
   refreshAccountBalances: () => void;
-  
-  // Budget Guard / Auto-Shutdown
-  triggerBudgetShutdown: (accountId: string, reason?: string) => void;
-  resumeAccountServices: (accountId: string) => void;
-  updateBudgetGuardRule: (accountId: string, enabled: boolean, threshold: number) => void;
   
   // Service & Deployment Actions
   deployService: (
@@ -77,6 +104,7 @@ interface HubContextType {
   ) => Promise<{ success: boolean; error?: string }>;
   restartService: (serviceId: string) => Promise<{ success: boolean; error?: string }>;
   redeployService: (serviceId: string) => Promise<{ success: boolean; error?: string }>;
+  updateSourceService: (serviceId: string) => Promise<{ success: boolean; error?: string }>;
   stopService: (serviceId: string) => Promise<{ success: boolean; error?: string }>;
   startService: (serviceId: string) => Promise<{ success: boolean; error?: string }>;
   deleteService: (serviceId: string) => Promise<{ success: boolean; error?: string }>;
@@ -93,6 +121,9 @@ interface HubContextType {
   // Logs & Live Feed
   setIsStreamingLogs: (streaming: boolean) => void;
   addLog: (log: Omit<LogEntry, 'id' | 'timestamp'>) => void;
+  /** Volume ids this app deleted — Railway's `project.volumes` still lists them. */
+  deletedVolumeIds: string[];
+  markVolumeDeleted: (volumeId: string) => void;
   clearLogs: () => void;
   
   // Aggregate Metrics & Stats
@@ -107,14 +138,44 @@ interface HubContextType {
 
 const HubContext = createContext<HubContextType | undefined>(undefined);
 
+const DEPLOY_JOB_STORAGE_KEY = 'railway_hub_deploy_job_v1';
 const THEME_STORAGE_KEY = 'railway_hub_theme_v4';
+/** Reload persistence: which account / tab the user was last on. */
+const ACTIVE_ACCOUNT_STORAGE_KEY = 'railway_hub_active_account_v1';
+const ACTIVE_TAB_STORAGE_KEY = 'railway_hub_active_tab_v1';
+/** Volumes deleted from this app. Railway keeps returning them from
+ *  `project.volumes` forever (Volume has no deletedAt), so the hub has to
+ *  remember what it removed instead of trusting that query alone. */
+const DELETED_VOLUME_STORAGE_KEY = 'railway_hub_deleted_volumes_v1';
+/** How long a FINISHED deploy banner/strip stays on screen before it goes. */
+const DEPLOY_DONE_TTL_MS = 10_000;
+/** A "running" job nobody can finish any more (tab closed mid-build) expires. */
+const DEPLOY_JOB_MAX_RUNNING_MS = 30 * 60_000;
+const SERVICE_DEPLOY_MAX_RUNNING_MS = 60 * 60_000;
+const HUB_TABS = ['dashboard', 'accounts', 'nodes', 'metrics', 'alerts'] as const;
+type HubTab = (typeof HUB_TABS)[number];
 
 export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // 1. Accounts State (loaded from server after auth)
   const [accounts, setAccounts] = useState<RailwayAccount[]>(INITIAL_ACCOUNTS);
 
-  const [activeAccountId, setActiveAccountId] = useState<string>('all');
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'accounts' | 'nodes' | 'logs' | 'metrics' | 'alerts'>('dashboard');
+  // Both selections restore from localStorage so a refresh lands the user back
+  // on the account/tab they were on. A stale account id (deleted account) is
+  // corrected by the "keep one real account selected" effect below.
+  const [activeAccountId, setActiveAccountId] = useState<string>(() => {
+    try {
+      return localStorage.getItem(ACTIVE_ACCOUNT_STORAGE_KEY) || 'all';
+    } catch (e) {
+      return 'all';
+    }
+  });
+  const [activeTab, setActiveTab] = useState<HubTab>(() => {
+    try {
+      const saved = localStorage.getItem(ACTIVE_TAB_STORAGE_KEY);
+      if (saved && (HUB_TABS as readonly string[]).includes(saved)) return saved as HubTab;
+    } catch (e) {}
+    return 'dashboard';
+  });
 
   // 2. Alerts
   const [alerts, setAlerts] = useState<AlertNotification[]>([]);
@@ -124,9 +185,96 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [isStreamingLogs, setIsStreamingLogs] = useState<boolean>(true);
   const [isSyncingProjects, setIsSyncingProjects] = useState<boolean>(false);
 
-  // Global deploy job — lives in context so the progress banner keeps
-  // updating after DeployModal is closed.
-  const [deployJob, setDeployJob] = useState<DeployJobState | null>(null);
+  // Global deploy job — persisted in localStorage so the progress banner in Header
+  // survives browser refreshes, tab switches, and closing modals. A FINISHED job
+  // is never restored (there is nothing left to show) and every write is stamped
+  // so a job nobody can complete any more expires instead of lingering.
+  const [deployJob, setDeployJobState] = useState<DeployJobState | null>(() => {
+    try {
+      const saved = localStorage.getItem(DEPLOY_JOB_STORAGE_KEY);
+      const job = saved ? JSON.parse(saved) : null;
+      if (job && job.status === 'running') return job as DeployJobState;
+    } catch (e) {}
+    return null;
+  });
+
+  const setDeployJob = useCallback<React.Dispatch<React.SetStateAction<DeployJobState | null>>>(
+    (action) => {
+      setDeployJobState((prev) => {
+        const next =
+          typeof action === 'function'
+            ? (action as (p: DeployJobState | null) => DeployJobState | null)(prev)
+            : action;
+        return next ? { ...next, updatedAt: Date.now() } : null;
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    try {
+      if (deployJob) {
+        localStorage.setItem(DEPLOY_JOB_STORAGE_KEY, JSON.stringify(deployJob));
+      } else {
+        localStorage.removeItem(DEPLOY_JOB_STORAGE_KEY);
+      }
+    } catch (e) {}
+  }, [deployJob]);
+
+  // Per-service permanent deploy states — attached directly to cards, never lost on tab change/refresh or when closing header banner
+  const SERVICE_DEPLOY_STATES_STORAGE_KEY = 'railway_hub_service_deploy_states_v2';
+  const [serviceDeployStates, setServiceDeployStates] = useState<Record<string, ServiceDeployState>>(() => {
+    try {
+      const saved = localStorage.getItem(SERVICE_DEPLOY_STATES_STORAGE_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return {};
+  });
+
+  const setServiceDeployState = useCallback((serviceId: string, state: ServiceDeployState | null) => {
+    setServiceDeployStates((prev) => {
+      const next = { ...prev };
+      if (!state) {
+        delete next[serviceId];
+      } else {
+        next[serviceId] = { ...state, updatedAt: Date.now() };
+      }
+      try {
+        localStorage.setItem(SERVICE_DEPLOY_STATES_STORAGE_KEY, JSON.stringify(next));
+      } catch (e) {}
+      return next;
+    });
+  }, []);
+
+  // A finished deploy is FEEDBACK, not a badge: drop the header banner a few
+  // seconds after success/error instead of leaving it up until dismissed.
+  useEffect(() => {
+    if (!deployJob) return;
+    const age = Date.now() - (deployJob.updatedAt || 0);
+    const delay =
+      deployJob.status !== 'running'
+        ? Math.max(0, DEPLOY_DONE_TTL_MS - age)
+        : Math.max(0, DEPLOY_JOB_MAX_RUNNING_MS - age);
+    const t = window.setTimeout(() => setDeployJob(null), delay);
+    return () => clearTimeout(t);
+  }, [deployJob, setDeployJob]);
+
+  // Same for the strip on the service card — this is what used to stay on the
+  // card forever after the build ended.
+  useEffect(() => {
+    const entries = Object.entries(serviceDeployStates);
+    if (entries.length === 0) return;
+    const now = Date.now();
+    const timers = entries.map(([serviceId, st]) => {
+      const age = now - (st.updatedAt || 0);
+      const delay =
+        st.status !== 'running'
+          ? Math.max(0, DEPLOY_DONE_TTL_MS - age)
+          : Math.max(0, SERVICE_DEPLOY_MAX_RUNNING_MS - age);
+      return window.setTimeout(() => setServiceDeployState(serviceId, null), delay);
+    });
+    return () => timers.forEach((t) => clearTimeout(t));
+  }, [serviceDeployStates, setServiceDeployState]);
 
   // 5. Theme (UI preference — stays in localStorage)
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -205,6 +353,39 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [theme]);
 
+  // Remember the selected account/tab so a refresh (or PWA relaunch) returns
+  // to the same place instead of resetting to the dashboard's first account.
+  useEffect(() => {
+    try {
+      localStorage.setItem(ACTIVE_ACCOUNT_STORAGE_KEY, activeAccountId);
+      localStorage.setItem(ACTIVE_TAB_STORAGE_KEY, activeTab);
+    } catch (e) {}
+  }, [activeAccountId, activeTab]);
+
+  const [deletedVolumeIds, setDeletedVolumeIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(DELETED_VOLUME_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
+    } catch (e) {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(DELETED_VOLUME_STORAGE_KEY, JSON.stringify(deletedVolumeIds));
+    } catch (e) {}
+  }, [deletedVolumeIds]);
+
+  /** Records a volume the user removed so it stops being listed even though
+   *  Railway's `project.volumes` keeps reporting it. */
+  const markVolumeDeleted = useCallback((volumeId: string) => {
+    setDeletedVolumeIds((prev) =>
+      prev.includes(volumeId) ? prev : [...prev, volumeId].slice(-500)
+    );
+  }, []);
+
   const toggleTheme = () => {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
   };
@@ -215,12 +396,12 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return accounts.find((a) => a.id === activeAccountId) || null;
   }, [accounts, activeAccountId]);
 
-  // There is no global "all accounts" view anymore — whenever accounts exist,
-  // keep exactly one real account selected (also recovers after deletions).
+  // Support global 'all' accounts view or keep a valid account selected
   useEffect(() => {
     if (accounts.length === 0) return;
-    if (activeAccountId !== 'all' && accounts.some((a) => a.id === activeAccountId)) return;
-    setActiveAccountId(accounts[0].id);
+    if (activeAccountId === 'all') return;
+    if (accounts.some((a) => a.id === activeAccountId)) return;
+    setActiveAccountId('all');
   }, [accounts, activeAccountId]);
 
   // Aggregate All Services (only services of real Railway projects; deleted and
@@ -237,6 +418,23 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
     return list;
   }, [accounts]);
+
+  // Reconcile with Railway: once the real deployment has settled, anything
+  // still marked "running" is lying (tab closed mid-build, or a flow that
+  // never reported back) — clear it rather than showing an ended build.
+  // Placed after allServices: the effect reads it in its dependency array.
+  useEffect(() => {
+    for (const srv of allServices) {
+      const st = serviceDeployStates[srv.id];
+      if (st && st.status === 'running' && isDeploymentSettled(srv)) {
+        setServiceDeployState(srv.id, null);
+      }
+    }
+    if (deployJob?.status === 'running' && deployJob.serviceId) {
+      const srv = allServices.find((s) => s.id === deployJob.serviceId);
+      if (srv && isDeploymentSettled(srv)) setDeployJob(null);
+    }
+  }, [allServices, serviceDeployStates, deployJob, setServiceDeployState, setDeployJob]);
 
   // Stats calculation
   const totalCreditsLimit = useMemo(() => accounts.reduce((sum, a) => sum + (a.creditLimit || 0), 0), [accounts]);
@@ -285,98 +483,12 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   }, [activeAccount, accounts, addLog]);
 
-  // Budget Guard Auto-Shutdown Executor
-  const triggerBudgetShutdown = useCallback((accountId: string, reason?: string) => {
-    setAccounts((prev) =>
-      prev.map((acc) => {
-        if (acc.id !== accountId) return acc;
-        // Idempotent: never re-fire for an account already shut down.
-        if (acc.isShutdownTriggered) return acc;
-
-        const updatedProjects = acc.projects.map((proj) => ({
-          ...proj,
-          services: proj.services.map((srv) => ({
-            ...srv,
-            status: 'stopped' as ServiceStatus,
-            uptime: 'متوقف شده (محافظ بودجه)',
-            cpuUsage: 0,
-            memoryUsage: 0,
-          })),
-        }));
-
-        return {
-          ...acc,
-          isShutdownTriggered: true,
-          shutdownTriggeredAt: new Date().toISOString(),
-          projects: updatedProjects,
-        };
-      })
-    );
-
-    const targetAccount = accounts.find((a) => a.id === accountId);
-    const msg = reason || `اعتبار باقی‌مانده حساب ${targetAccount?.name} (${targetAccount?.creditRemaining}$) به زیر آستانه محافظتی (${targetAccount?.autoShutdownThreshold}$) رسید. تمامی نودها جهت جلوگیری از هزینه متوقف شدند.`;
-    
-    sendCustomAlert('🚨 توقف خودکار نودها (Budget Guard)', msg, 'critical');
-    addLog({
-      level: 'error',
-      serviceName: 'BudgetGuard',
-      message: `[AUTO_SHUTDOWN] Account ${targetAccount?.name} nodes successfully paused to prevent budget overflow.`,
-    });
-  }, [accounts, sendCustomAlert, addLog]);
-
-  // Resume services after shutdown
-  const resumeAccountServices = useCallback((accountId: string) => {
-    setAccounts((prev) =>
-      prev.map((acc) => {
-        if (acc.id !== accountId) return acc;
-        const updatedProjects = acc.projects.map((proj) => ({
-          ...proj,
-          services: proj.services.map((srv) => ({
-            ...srv,
-            status: 'healthy' as ServiceStatus,
-            uptime: '1m (تازه‌راه‌اندازی)',
-            cpuUsage: Math.floor(10 + Math.random() * 20),
-            memoryUsage: Math.floor(120 + Math.random() * 80),
-          })),
-        }));
-        return {
-          ...acc,
-          isShutdownTriggered: false,
-          projects: updatedProjects,
-        };
-      })
-    );
-
-    const targetAccount = accounts.find((a) => a.id === accountId);
-    sendCustomAlert('✅ راه‌اندازی مجدد نودها', `نودهای حساب ${targetAccount?.name} مجدداً فعال شدند.`, 'info');
-    addLog({
-      level: 'info',
-      serviceName: 'BudgetGuard',
-      message: `[RESUME] Account ${targetAccount?.name} nodes brought back online.`,
-    });
-  }, [accounts, sendCustomAlert, addLog]);
-
-  // Update Budget Guard Rules
-  const updateBudgetGuardRule = useCallback((accountId: string, enabled: boolean, threshold: number) => {
-    setAccounts((prev) =>
-      prev.map((acc) => {
-        if (acc.id !== accountId) return acc;
-        return {
-          ...acc,
-          autoShutdownEnabled: enabled,
-          autoShutdownThreshold: threshold,
-        };
-      })
-    );
-  }, []);
-
   // Add Account with Token Validation
   const addAccount = useCallback(async (accountData: {
     name?: string;
     token: string;
     color?: string;
     creditLimit?: number;
-    autoShutdownThreshold?: number;
     email?: string;
   }): Promise<{ success: boolean; error?: string }> => {
     const rawToken = accountData.token.trim();
@@ -439,9 +551,6 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       hourlyBurnRate: 0, // computed from real Railway usage deltas after the first sync
       status: 'active',
       lastChecked: new Date().toISOString(),
-      autoShutdownEnabled: true,
-      autoShutdownThreshold: accountData.autoShutdownThreshold || 0.5,
-      isShutdownTriggered: false,
       isRealVerified: true,
       projects: parsedProjects,
       projectLimit: extractedProjectLimit,
@@ -537,8 +646,11 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return;
     }
 
-    for (const acc of listToSync) {
-      if (!acc.token) continue;
+    /** One account's sync. Accounts run CONCURRENTLY (see runWithConcurrency)
+     *  — Railway takes seconds per call, so doing 32 accounts back-to-back is
+     *  what made a freshly created service take minutes to show up. */
+    const syncOne = async (acc: RailwayAccount) => {
+      if (!acc.token) return;
       try {
         const res = await syncRailwayProjects(acc.token);
 
@@ -552,7 +664,7 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               message: `[SYNC_SKIPPED] Railway unreachable for ${acc.name}; kept existing project state. (${res.error || res.httpStatus})`,
             });
           }
-          continue;
+          return;
         }
 
         {
@@ -587,6 +699,7 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                   createdAt: fp.createdAt || new Date().toISOString(),
                   updatedAt: fp.updatedAt || new Date().toISOString(),
                   services: formattedServices,
+                  volumes: fp.volumes || [],
                 });
               });
 
@@ -598,6 +711,8 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                     projMap.set(ep.id, {
                       ...ep,
                       isDeletedOnRailway: true,
+                      // A deleted project has no disks left on Railway.
+                      volumes: [],
                     });
                   }
                 } else {
@@ -657,7 +772,10 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       } catch (e) {
         console.error('Failed syncing projects for account', acc.id, e);
       }
-    }
+    };
+
+    // 5 in flight: far fewer round trips overall without hammering Railway.
+    await runWithConcurrency(listToSync, 5, syncOne);
     setIsSyncingProjects(false);
   }, [accounts, addLog]);
 
@@ -693,7 +811,6 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       domains?: RailwayServiceDomain[];
     }
   ): Promise<{ success: boolean; error?: string }> => {
-    const template = TEMPLATES.find((t) => t.id === serviceData.templateType) || TEMPLATES[0];
     const targetAccountId = accountId === 'all' ? (accounts[0]?.id || 'acc-1') : accountId;
 
     // The hub only deploys into real Railway projects; it never fabricates one.
@@ -726,9 +843,9 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       projectId: realProject.id,
       accountId: targetAccountId,
       name: serviceData.name.toLowerCase().replace(/\s+/g, '-'),
-      icon: template.icon,
+      icon: '🐳',
       templateType: serviceData.templateType as any,
-      imageOrRepo: serviceData.imageOrRepo || template.defaultImage,
+      imageOrRepo: serviceData.imageOrRepo || 'custom-repository',
       status: 'deploying',
       cpuUsage: 45,
       memoryUsage: 140,
@@ -738,10 +855,10 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       uptime: 'در حال بیلد...',
       restartsCount: 0,
       region: serviceData.region || 'eu-west-1 (Frankfurt)',
-      port: serviceData.port || template.defaultPort,
+      port: serviceData.port || 80,
       healthEndpoint: '/health',
       domains: serviceData.domains && serviceData.domains.length > 0 ? serviceData.domains : defaultDomains,
-      envVars: serviceData.envVars || template.defaultEnv,
+      envVars: serviceData.envVars || {},
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       historyMetrics: [],
@@ -767,54 +884,52 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     addLog({
       level: 'info',
       serviceName: newService.name,
-      message: `[DEPLOY] Triggered build container for ${newService.name} with template ${template.name}.`,
+      message: `[DEPLOY] Triggered build container for ${newService.name}.`,
     });
 
-    // Simulate build and deployment progression
-    setTimeout(() => {
-      addLog({
-        level: 'info',
-        serviceName: newService.name,
-        message: `[BUILD] Image ${newService.imageOrRepo} pulled successfully. Running build steps...`,
-      });
-    }, 1500);
+    // Only a service Railway doesn't know about (no railwayServiceId → local
+    // placeholder id) needs a simulated finish: a real service gets its status
+    // from sync, which reports the actual deployment. Flipping every service to
+    // "healthy" after 3.8s used to mark builds green while Railway was still
+    // building them — and sync then flipped them back, so the pill flickered.
+    if (!serviceData.railwayServiceId) {
+      setTimeout(() => {
+        addLog({
+          level: 'info',
+          serviceName: newService.name,
+          message: `[CONTAINER] Port ${newService.port} bound. Health check probe /health listening.`,
+        });
 
-    setTimeout(() => {
-      addLog({
-        level: 'info',
-        serviceName: newService.name,
-        message: `[CONTAINER] Port ${newService.port} bound. Health check probe /health listening.`,
-      });
+        // Mark healthy
+        setAccounts((prev) =>
+          prev.map((acc) => {
+            if (acc.id !== targetAccountId) return acc;
+            const updatedProjects = acc.projects.map((p) => ({
+              ...p,
+              services: p.services.map((s) =>
+                s.id === newServiceId
+                  ? {
+                      ...s,
+                      status: 'healthy' as ServiceStatus,
+                      uptime: '1m',
+                      cpuUsage: Math.floor(8 + Math.random() * 15),
+                      memoryUsage: Math.floor(95 + Math.random() * 50),
+                    }
+                  : s
+              ),
+            }));
+            return { ...acc, projects: updatedProjects };
+          })
+        );
 
-      // Mark healthy
-      setAccounts((prev) =>
-        prev.map((acc) => {
-          if (acc.id !== targetAccountId) return acc;
-          const updatedProjects = acc.projects.map((p) => ({
-            ...p,
-            services: p.services.map((s) =>
-              s.id === newServiceId
-                ? {
-                    ...s,
-                    status: 'healthy' as ServiceStatus,
-                    uptime: '1m',
-                    cpuUsage: Math.floor(8 + Math.random() * 15),
-                    memoryUsage: Math.floor(95 + Math.random() * 50),
-                  }
-                : s
-            ),
-          }));
-          return { ...acc, projects: updatedProjects };
-        })
-      );
-
-      sendCustomAlert(
-        '🚀 دپلوی با موفقیت انجام شد',
-        `سرویس ${newService.name} با پورت ${newService.port} در ریجن ${newService.region} با موفقیت آنلاین شد.`,
-        'info',
-        newService.name
-      );
-    }, 3800);
+        sendCustomAlert(
+          '🚀 دپلوی با موفقیت انجام شد',
+          `سرویس ${newService.name} با پورت ${newService.port} در ریجن ${newService.region} با موفقیت آنلاین شد.`,
+          'info',
+          newService.name
+        );
+      }, 3800);
+    }
 
     return { success: true };
   }, [accounts, addLog, sendCustomAlert]);
@@ -846,17 +961,19 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     );
   }, []);
 
-  /** Shared flow for restart / redeploy / stop: locate the service, call the
-   *  real Railway mutation, then re-sync so the card shows actual deployment
-   *  state instead of the optimistic patch. Never throws — card handlers are
-   *  fire-and-forget; failures land in the log and the returned result. */
+  /** Shared flow for restart / redeploy / manual source update / stop: locate
+   *  the service, call the real Railway mutation, then re-sync so the card shows
+   *  actual deployment state instead of the optimistic patch. Never throws —
+   *  card handlers are fire-and-forget; failures land in the log and the
+   *  returned result. `successLog` may be a function so the update action can
+   *  report WHICH mutation the server picked (image vs repo source). */
   const runDeploymentAction = useCallback(
     async (
       serviceId: string,
-      action: 'restart' | 'redeploy' | 'stop',
+      action: 'restart' | 'redeploy' | 'update' | 'stop',
       pendingStatus: ServiceStatus,
       pendingLabel: string,
-      successLog: string
+      successLog: string | ((res: any) => string)
     ): Promise<{ success: boolean; error?: string }> => {
       try {
         const ref = findServiceRef(serviceId);
@@ -878,13 +995,18 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             ? await restartRailwayService(params)
             : action === 'redeploy'
               ? await redeployRailwayService(params)
-              : await stopRailwayService(params);
+              : action === 'update'
+                ? await manualUpdateRailwayService(params)
+                : await stopRailwayService(params);
 
         const apiError = extractApiError(res, '');
         const ok =
           action === 'redeploy'
             ? !apiError && !!res?.data?.deploymentRedeploy?.id
-            : !apiError && res?.data?.[action === 'restart' ? 'deploymentRestart' : 'deploymentStop'] === true;
+            : action === 'update'
+              ? !apiError &&
+                (res?.data?.serviceInstanceRedeploy === true || res?.data?.serviceInstanceDeploy === true)
+              : !apiError && res?.data?.[action === 'restart' ? 'deploymentRestart' : 'deploymentStop'] === true;
 
         if (!ok) {
           const message = apiError || 'درخواست به ریلوی ارسال نشد.';
@@ -893,7 +1015,11 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return { success: false, error: message };
         }
 
-        addLog({ level: 'info', serviceName: srv.name, message: successLog });
+        addLog({
+          level: 'info',
+          serviceName: srv.name,
+          message: typeof successLog === 'function' ? successLog(res) : successLog,
+        });
         await syncAccountProjects(acc.id);
         return { success: true };
       } catch (err: any) {
@@ -927,6 +1053,24 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         'deploying',
         'در حال دیپلوی مجدد...',
         '[REDEPLOY] deploymentRedeploy ارسال شد؛ استقرار جدید در صف قرار گرفت.'
+      ),
+    [runDeploymentAction]
+  );
+
+  // Manual source update — the source changed upstream (new image tag, new
+  // commit) but nothing told Railway about it. Image sources re-pull the tag,
+  // Git sources deploy the latest commit; the server picks by reading source.
+  const updateSourceService = useCallback(
+    (serviceId: string) =>
+      runDeploymentAction(
+        serviceId,
+        'update',
+        'deploying',
+        'در حال آپدیت از آخرین سورس...',
+        (res) =>
+          res?.method === 'serviceInstanceDeploy'
+            ? '[UPDATE] serviceInstanceDeploy(latestCommit: true) ارسال شد؛ آخرین کامیت در صف دیپلوی قرار گرفت.'
+            : '[UPDATE] serviceInstanceRedeploy ارسال شد؛ تگ ایمیج دوباره pull می‌شود.'
       ),
     [runDeploymentAction]
   );
@@ -1191,21 +1335,6 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => clearInterval(timer);
   }, [refreshAccountBalances]);
 
-  // Budget Guard: evaluate the REAL Railway credit and auto-shutdown when it drops
-  // below the account's threshold. Runs on real credit changes, not a local timer.
-  useEffect(() => {
-    accounts.forEach((acc) => {
-      if (
-        acc.autoShutdownEnabled &&
-        !acc.isShutdownTriggered &&
-        typeof acc.creditRemaining === 'number' &&
-        acc.creditRemaining <= acc.autoShutdownThreshold
-      ) {
-        triggerBudgetShutdown(acc.id);
-      }
-    });
-  }, [accounts, triggerBudgetShutdown]);
-
   const value = {
     accounts,
     activeAccountId,
@@ -1218,6 +1347,8 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     theme,
     deployJob,
     setDeployJob,
+    serviceDeployStates,
+    setServiceDeployState,
     setActiveAccountId,
     setActiveTab,
     toggleTheme,
@@ -1227,12 +1358,10 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     deleteAccount,
     deleteProject,
     refreshAccountBalances,
-    triggerBudgetShutdown,
-    resumeAccountServices,
-    updateBudgetGuardRule,
     deployService,
     restartService,
     redeployService,
+    updateSourceService,
     stopService,
     startService,
     deleteService,
@@ -1241,6 +1370,8 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setIsStreamingLogs,
     addLog,
     clearLogs,
+    deletedVolumeIds,
+    markVolumeDeleted,
     allServices,
     totalCreditsLimit,
     totalCreditsUsed,

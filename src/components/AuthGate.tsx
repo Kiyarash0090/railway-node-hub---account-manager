@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Lock, ShieldCheck, User, RefreshCw, AlertTriangle } from 'lucide-react';
-import { getAuthStatus, loginAuth, setupAuth, resetAuth } from '../services/authApi';
+import { Lock, ShieldCheck, User } from 'lucide-react';
+import { getAuthStatus, loginAuth, setupAuth } from '../services/authApi';
 
 type AuthPhase = 'loading' | 'setup' | 'login' | 'ready';
 
@@ -17,8 +17,6 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [showResetConfirm, setShowResetConfirm] = useState(false);
-  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -86,22 +84,6 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
       setPhase('ready');
     } else {
       setError(result.error || 'نام کاربری یا رمز عبور اشتباه است');
-    }
-  };
-
-  const handleResetAuth = async () => {
-    setResetting(true);
-    setError('');
-    const result = await resetAuth();
-    setResetting(false);
-    setShowResetConfirm(false);
-    if (result.success) {
-      setUsername('admin');
-      setPassword('');
-      setConfirmPassword('');
-      setPhase('setup');
-    } else {
-      setError(result.error || 'خطا در بازنشانی حساب');
     }
   };
 
@@ -202,50 +184,8 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
           </button>
         </form>
 
-        {/* Reset credentials option in case user forgot password */}
-        {!isSetup && !showResetConfirm && (
-          <div className="mt-4 flex justify-center">
-            <button
-              type="button"
-              onClick={() => setShowResetConfirm(true)}
-              className="text-xs text-neutral-500 hover:text-purple-400 transition underline underline-offset-4"
-            >
-              فراموشی رمز عبور یا بازنشانی حساب؟
-            </button>
-          </div>
-        )}
-
-        {showResetConfirm && (
-          <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-right" dir="rtl">
-            <div className="flex items-center gap-2 text-amber-400 text-xs font-medium mb-1">
-              <AlertTriangle className="h-4 w-4 shrink-0" />
-              <span>بازنشانی حساب مدیریت</span>
-            </div>
-            <p className="text-[11px] text-neutral-300 mb-3 leading-4">
-              با بازنشانی حساب، رمز عبور پاک شده و می‌توانید حساب جدید بسازید. اکانت‌ها و دیتابیس ریلوی شما دست‌نخورده باقی می‌ماند.
-            </p>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={handleResetAuth}
-                disabled={resetting}
-                className="flex-1 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-500 transition disabled:opacity-50"
-              >
-                {resetting ? 'در حال بازنشانی…' : 'تأیید و بازنشانی'}
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowResetConfirm(false)}
-                className="rounded-lg bg-neutral-800 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-700 transition"
-              >
-                انصراف
-              </button>
-            </div>
-          </div>
-        )}
-
-        <p className="mt-4 text-center text-[11px] leading-5 text-neutral-500">
-          نشست کاربری شما هم با توکن رمزنگاری‌شده و هم با کوکی امن نگهداری می‌شود.
+        <p className="mt-6 text-center text-[11px] leading-5 text-neutral-500">
+          دسترسی به این پنل توسط احراز هویت توکن رمزنگاری‌شده و کوکی امن محافظت می‌شود.
         </p>
       </div>
     </div>

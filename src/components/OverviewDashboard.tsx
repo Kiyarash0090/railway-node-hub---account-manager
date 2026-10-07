@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import {
   Wallet,
   Activity,
@@ -8,26 +8,31 @@ import {
   Plus,
   ArrowUpRight,
   Terminal,
-  Zap,
   Play,
   RotateCw,
   AlertOctagon,
   ChevronLeft,
+  ChevronRight,
+  Layers,
+  Sparkles,
+  Search,
+  X,
+  Globe,
+  SlidersHorizontal,
+  CheckCircle2,
 } from 'lucide-react';
 import { useHub } from '../context/HubContext';
-import { TEMPLATES } from '../constants/initialData';
 import { ServiceIcon } from './ServiceIcon';
+import { regionLabel } from '../types';
 
 interface OverviewDashboardProps {
-  onOpenDeploy: () => void;
   onOpenAddAccount: () => void;
-  onOpenBudgetGuard: () => void;
 }
 
+type AccountFilter = 'all' | 'with-services' | 'low-credit';
+
 export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
-  onOpenDeploy,
   onOpenAddAccount,
-  onOpenBudgetGuard,
 }) => {
   const {
     accounts,
@@ -43,9 +48,37 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
     stoppedServicesCount,
     logs,
     setActiveTab,
-    resumeAccountServices,
     restartService,
   } = useHub();
+
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<AccountFilter>('all');
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Scroll carousel left/right
+  const handleScroll = (direction: 'left' | 'right') => {
+    if (scrollRef.current) {
+      const scrollAmount = direction === 'left' ? -280 : 280;
+      scrollRef.current.scrollBy({ left: scrollAmount, behavior: 'smooth' });
+    }
+  };
+
+  // Filtered accounts list
+  const filteredAccounts = useMemo(() => {
+    return accounts.filter((acc) => {
+      const nodeCount = acc.projects.filter((p) => !p.isDeletedOnRailway && p.isExternal).reduce((s, p) => s + p.services.length, 0);
+      if (statusFilter === 'with-services' && nodeCount === 0) return false;
+      if (statusFilter === 'low-credit' && acc.creditRemaining >= 0.5) return false;
+
+      const q = searchQuery.trim().toLowerCase();
+      if (!q) return true;
+      const nameMatch = acc.name.toLowerCase().includes(q);
+      const emailMatch = acc.email.toLowerCase().includes(q);
+      const tagMatch = (acc.tags || []).some((t) => t.toLowerCase().includes(q));
+      const regionMatch = (acc.preferredRegion || '').toLowerCase().includes(q);
+      return nameMatch || emailMatch || tagMatch || regionMatch;
+    });
+  }, [accounts, statusFilter, searchQuery]);
 
   if (accounts.length === 0) {
     return (
@@ -90,7 +123,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
 
   const currentBurnRate = activeAccount
     ? activeAccount.hourlyBurnRate
-    : accounts.reduce((acc, a) => acc + (a.isShutdownTriggered ? 0 : a.hourlyBurnRate), 0);
+    : accounts.reduce((acc, a) => acc + a.hourlyBurnRate, 0);
 
   const projectedDaysLeft = currentBurnRate > 0 ? (currentRemaining / (currentBurnRate * 24)).toFixed(0) : '∞';
 
@@ -98,136 +131,265 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
     ? activeAccount.projects.filter((p) => !p.isDeletedOnRailway && p.isExternal).flatMap((p) => p.services)
     : allServices;
 
-  const shutdownAccounts = accounts.filter((a) => a.isShutdownTriggered);
+  const totalNodesCount = accounts.reduce(
+    (s, a) => s + a.projects.filter((p) => !p.isDeletedOnRailway && p.isExternal).reduce((sp, p) => sp + p.services.length, 0),
+    0
+  );
 
   return (
     <div className="space-y-5 pb-20 lg:pb-8 w-full max-w-full overflow-hidden">
       
-      {/* 1. Auto-Shutdown Warning Banner (if any account triggered budget guard) */}
-      {shutdownAccounts.length > 0 && (
-        <div className="rounded-2xl border border-rose-500/30 bg-rose-950/20 p-3.5 sm:p-5 backdrop-blur-md shadow-lg max-w-full overflow-hidden">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-            <div className="flex items-start gap-2.5 min-w-0">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-rose-500/20 text-rose-400 ring-1 ring-rose-500/30">
-                <ShieldAlert className="h-5 w-5" />
+      {/* 2. Scalable Multi-Account Hub Ribbon (Slider Only) */}
+      <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/50 p-3 sm:p-4 backdrop-blur-xl shadow-lg relative max-w-full overflow-hidden">
+        
+        {/* Header Bar with Title, Total Badge, Search, and Add Button */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-neutral-800/80">
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex items-center gap-1.5">
+              <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/20">
+                <Wallet className="h-3.5 w-3.5" />
               </div>
-              <div className="min-w-0">
-                <h3 className="font-bold text-rose-200 text-xs sm:text-sm truncate">
-                  محافظ بودجه فعال شد ({shutdownAccounts.length} اکانت متوقف شد)
-                </h3>
-                <p className="text-[11px] sm:text-xs text-rose-300/80 mt-0.5 leading-relaxed">
-                  اعتبار حساب‌های{' '}
-                  <span className="font-semibold text-white">
-                    {shutdownAccounts.map((a) => a.name).join('، ')}
-                  </span>{' '}
-                  به کمتر از حد آستانه رسید و نودها متوقف شدند.
-                </p>
-              </div>
+              <h2 className="text-xs sm:text-sm font-black text-white">اکانت‌های متصل به هاب</h2>
             </div>
-            <div className="flex items-center gap-2 w-full sm:w-auto shrink-0">
-              <button
-                onClick={() => shutdownAccounts.forEach((a) => resumeAccountServices(a.id))}
-                className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 rounded-xl bg-rose-600 px-3 py-1.5 sm:py-2 text-xs font-semibold text-white hover:bg-rose-500 transition shadow-sm"
-              >
-                <Play className="h-3.5 w-3.5" />
-                راه‌اندازی نودها
-              </button>
-              <button
-                onClick={onOpenBudgetGuard}
-                className="flex-1 sm:flex-none rounded-xl border border-rose-400/30 px-3 py-1.5 sm:py-2 text-xs font-medium text-rose-200 hover:bg-rose-900/30 transition"
-              >
-                آستانه
-              </button>
+            
+            <div className="flex items-center gap-1.5 text-[10px] sm:text-[11px] font-mono">
+              <span className="rounded-full bg-purple-500/15 border border-purple-500/30 px-2 py-0.5 font-bold text-purple-300">
+                {accounts.length} اکانت
+              </span>
+              <span className="text-neutral-500">·</span>
+              <span className="text-emerald-400 font-bold">${totalCreditsRemaining.toFixed(2)} کل</span>
             </div>
           </div>
-        </div>
-      )}
 
-      {/* 2. Account Switcher Ribbon */}
-      <div className="max-w-full overflow-hidden">
-        <div className="flex items-center justify-between mb-2.5">
-          <h2 className="text-xs sm:text-sm font-bold text-neutral-300 flex items-center gap-1.5">
-            <span>اکانت‌های متصل به هاب</span>
-            <span className="text-[11px] text-neutral-500 font-normal">({accounts.length})</span>
-          </h2>
-          <button
-            onClick={onOpenAddAccount}
-            className="flex items-center gap-1 text-[11px] sm:text-xs text-purple-400 hover:text-purple-300 font-medium transition"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            افزودن اکانت
-          </button>
+          <div className="flex items-center gap-1.5 self-end sm:self-auto">
+            {/* Search Input (visible if > 3 accounts) */}
+            {accounts.length > 3 && (
+              <div className="relative">
+                <Search className="absolute right-2.5 top-1/2 -translate-y-1/2 h-3 w-3 text-neutral-500" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="جستجوی اکانت..."
+                  className="w-28 sm:w-36 rounded-xl border border-neutral-800 bg-neutral-950 py-1 pr-7 pl-2 text-[11px] text-white placeholder-neutral-500 focus:border-purple-500 focus:outline-none"
+                />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="absolute left-2 top-1/2 -translate-y-1/2 text-neutral-500 hover:text-white"
+                  >
+                    <X className="h-2.5 w-2.5" />
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Add Account Button */}
+            <button
+              onClick={onOpenAddAccount}
+              className="flex items-center gap-1 rounded-xl bg-purple-600/90 hover:bg-purple-500 px-2.5 py-1 text-[11px] font-semibold text-white transition shadow-sm"
+              title="افزودن اکانت جدید"
+            >
+              <Plus className="h-3 w-3" />
+              <span className="hidden xs:inline">افزودن</span>
+            </button>
+          </div>
         </div>
 
-        <div className="grid grid-cols-1 xs:grid-cols-2 lg:grid-cols-4 gap-2.5">
-          {/* Individual Account Cards */}
-          {accounts.map((acc) => {
-            const isLow = acc.creditRemaining < acc.autoShutdownThreshold;
-            const isSelected = activeAccountId === acc.id;
-            return (
-              <div
-                key={acc.id}
-                onClick={() => setActiveAccountId(acc.id)}
-                className={`cursor-pointer rounded-2xl p-3.5 transition-all duration-200 border max-w-full overflow-hidden ${
-                  isSelected
-                    ? 'bg-neutral-900/95 border-neutral-600 ring-1 ring-white/20 shadow-lg'
-                    : 'bg-neutral-900/40 border-neutral-800 hover:bg-neutral-900/70'
+        {/* Status Filter Chips (when accounts > 4) */}
+        {accounts.length > 4 && (
+          <div className="flex items-center gap-1.5 pt-2.5 overflow-x-auto no-scrollbar">
+            {[
+              { id: 'all', label: 'همه اکانت‌ها', count: accounts.length },
+              { id: 'with-services', label: 'دارای سرویس', count: accounts.filter((a) => a.projects.some(p => !p.isDeletedOnRailway && p.isExternal && p.services.length > 0)).length },
+              { id: 'low-credit', label: 'کم‌اعتبار (<$0.5)', count: accounts.filter((a) => a.creditRemaining < 0.5).length },
+            ].map((f) => (
+              <button
+                key={f.id}
+                onClick={() => setStatusFilter(f.id as AccountFilter)}
+                className={`flex items-center gap-1 rounded-lg px-2 py-0.5 text-[10px] font-medium transition shrink-0 ${
+                  statusFilter === f.id
+                    ? 'bg-purple-600/30 border border-purple-500/50 text-purple-200'
+                    : 'bg-neutral-950/60 border border-neutral-800/80 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50'
                 }`}
               >
-                <div className="flex items-center justify-between gap-1">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <div
-                      className="h-2.5 w-2.5 shrink-0 rounded-full"
-                      style={{ backgroundColor: acc.color }}
-                    />
-                    <span className="text-xs font-bold text-white truncate">{acc.name}</span>
+                <span>{f.label}</span>
+                <span className="font-mono text-[9px] opacity-75">({f.count})</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* HORIZONTAL SCROLL / CAROUSEL SLIDER (The only sleek mode for the dashboard) */}
+        <div className="relative pt-3 group">
+          {/* Carousel navigation chevrons for easy scrolling */}
+          {filteredAccounts.length > 3 && (
+            <>
+              <button
+                onClick={() => handleScroll('right')}
+                className="absolute right-0 top-1/2 -translate-y-1/2 z-10 hidden sm:flex h-8 w-8 items-center justify-center rounded-full bg-neutral-950/90 border border-neutral-700 text-neutral-300 hover:text-white shadow-xl backdrop-blur-md opacity-0 group-hover:opacity-100 transition-opacity"
+                title="اسکرول به راست"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+              <button
+                onClick={() => handleScroll('left')}
+                className="absolute left-0 top-1/2 -translate-y-1/2 z-10 hidden sm:flex h-8 w-8 items-center justify-center rounded-full bg-neutral-950/90 border border-neutral-700 text-neutral-300 hover:text-white shadow-xl backdrop-blur-md opacity-0 group-hover:opacity-100 transition-opacity"
+                title="اسکرول به چپ"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+            </>
+          )}
+
+          <div
+            ref={scrollRef}
+            className="flex items-stretch gap-2.5 overflow-x-auto pb-1 pt-0.5 no-scrollbar scroll-smooth"
+          >
+            {/* Special First Card: "All Accounts / نمای کل هاب" */}
+            <div
+              onClick={() => setActiveAccountId('all')}
+              className={`cursor-pointer rounded-2xl p-3 transition-all duration-200 border min-w-[190px] sm:min-w-[215px] max-w-[230px] shrink-0 flex flex-col justify-between select-none ${
+                activeAccountId === 'all'
+                  ? 'bg-purple-950/40 border-purple-500/70 ring-2 ring-purple-500/30 shadow-lg shadow-purple-500/10'
+                  : 'bg-neutral-950/60 border-neutral-800/90 hover:border-neutral-700 hover:bg-neutral-900/60'
+              }`}
+            >
+              <div>
+                <div className="flex items-center justify-between gap-1 mb-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-tr from-purple-600 to-indigo-600 text-white shadow-sm">
+                      <Sparkles className="h-3.5 w-3.5" />
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-xs font-black text-white truncate block">کل اکانت‌ها</span>
+                      <span className="text-[10px] text-purple-300 font-medium">نمای جامع هاب</span>
+                    </div>
                   </div>
-                  {acc.isShutdownTriggered ? (
-                    <span className="text-[9px] font-semibold text-rose-400 bg-rose-500/10 px-1.5 py-0.5 rounded-full border border-rose-500/20 shrink-0">
-                      متوقف
-                    </span>
-                  ) : (
-                    <span className="text-[9px] text-neutral-400 bg-neutral-800 px-1.5 py-0.5 rounded-full shrink-0">
-                      {acc.plan}
+                  {activeAccountId === 'all' && (
+                    <span className="rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 px-1.5 py-0.2 text-[9px] font-bold shrink-0">
+                      فعال
                     </span>
                   )}
                 </div>
 
-                <div className="mt-2.5 flex items-baseline justify-between">
-                  <div>
-                    <span
-                      className={`text-lg sm:text-xl font-black font-mono ${
-                        isLow ? 'text-rose-400' : 'text-emerald-400'
-                      }`}
-                    >
-                      ${acc.creditRemaining.toFixed(2)}
-                    </span>
-                    <span className="text-[9px] text-neutral-400 mr-0.5">/ ${acc.creditLimit}</span>
-                  </div>
-                  <span className="text-[11px] text-neutral-400 font-mono">
-                    {acc.projects.filter((p) => !p.isDeletedOnRailway && p.isExternal).reduce((s, p) => s + p.services.length, 0)} نود
+                <div className="mt-1 flex items-baseline justify-between font-mono">
+                  <span className="text-base sm:text-lg font-black text-emerald-400">
+                    ${totalCreditsRemaining.toFixed(2)}
+                  </span>
+                  <span className="text-[10px] text-neutral-400">
+                    {totalNodesCount} نود
                   </span>
                 </div>
 
-                {/* Balance Progress Bar */}
-                <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-neutral-800">
+                <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-neutral-900 border border-neutral-800">
                   <div
-                    className={`h-full rounded-full transition-all duration-500 ${
-                      acc.isShutdownTriggered
-                        ? 'bg-rose-500'
-                        : isLow
-                        ? 'bg-amber-500'
-                        : 'bg-emerald-500'
-                    }`}
+                    className="h-full bg-gradient-to-r from-purple-500 to-emerald-400 transition-all duration-500"
                     style={{
-                      width: `${Math.min(100, Math.max(5, (acc.creditRemaining / acc.creditLimit) * 100))}%`,
+                      width: `${Math.min(100, (totalCreditsRemaining / (totalCreditsLimit || 1)) * 100)}%`,
                     }}
                   />
                 </div>
               </div>
-            );
-          })}
+
+              <div className="mt-2.5 pt-2 border-t border-neutral-800/80 flex items-center justify-between text-[10px] text-neutral-400">
+                <span>{accounts.length} اکانت متصل</span>
+                <span className="text-purple-400 font-semibold">مجموع</span>
+              </div>
+            </div>
+
+            {/* Individual Account Cards in Carousel */}
+            {filteredAccounts.map((acc) => {
+              const isLow = acc.creditRemaining < 0.5;
+              const isSelected = activeAccountId === acc.id;
+              const percent = Math.max(0, Math.min(100, (acc.creditRemaining / (acc.creditLimit || 1)) * 100));
+              const nodeCount = acc.projects.filter((p) => !p.isDeletedOnRailway && p.isExternal).reduce((s, p) => s + p.services.length, 0);
+
+              return (
+                <div
+                  key={acc.id}
+                  onClick={() => setActiveAccountId(acc.id)}
+                  className={`cursor-pointer rounded-2xl p-3 transition-all duration-200 border min-w-[200px] sm:min-w-[230px] max-w-[250px] shrink-0 flex flex-col justify-between select-none ${
+                    isSelected
+                      ? 'bg-neutral-900/95 border-purple-500/70 ring-2 ring-purple-500/30 shadow-lg shadow-purple-500/10'
+                      : 'bg-neutral-950/60 border-neutral-800/90 hover:border-neutral-700 hover:bg-neutral-900/60'
+                  }`}
+                >
+                  <div>
+                    {/* Top row: Avatar, Name & Status */}
+                    <div className="flex items-center justify-between gap-1 mb-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div
+                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white font-black text-xs shadow-sm"
+                          style={{ backgroundColor: acc.color }}
+                        >
+                          {acc.name.charAt(0).toUpperCase()}
+                        </div>
+                        <div className="min-w-0">
+                          <span className="text-xs font-bold text-white truncate block group-hover:text-purple-300 transition">
+                            {acc.name}
+                          </span>
+                          <span className="text-[10px] text-neutral-400 font-mono truncate block">
+                            {acc.email}
+                          </span>
+                        </div>
+                      </div>
+
+                      {isSelected ? (
+                        <span className="rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 px-1.5 py-0.2 text-[9px] font-bold shrink-0">
+                          انتخاب
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-neutral-900 px-1.5 py-0.2 text-[9px] text-neutral-400 border border-neutral-800 shrink-0">
+                          {acc.plan}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Middle row: Balance & Progress */}
+                    <div className="mt-1 flex items-baseline justify-between font-mono">
+                      <div>
+                        <span className={`text-base sm:text-lg font-black ${isLow ? 'text-rose-400' : 'text-emerald-400'}`}>
+                          ${acc.creditRemaining.toFixed(2)}
+                        </span>
+                        <span className="text-[9px] text-neutral-500 mr-1">/ ${acc.creditLimit}</span>
+                      </div>
+                      <span className="text-[10px] text-neutral-400">
+                        {nodeCount} نود
+                      </span>
+                    </div>
+
+                    {/* Progress Bar */}
+                    <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-neutral-900 border border-neutral-800">
+                      <div
+                        className={`h-full rounded-full transition-all duration-500 ${
+                          isLow
+                            ? 'bg-amber-500'
+                            : 'bg-emerald-500'
+                        }`}
+                        style={{ width: `${percent}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Bottom Metadata Tags */}
+                  <div className="mt-2.5 pt-2 border-t border-neutral-800/80 flex items-center justify-between text-[10px] text-neutral-400">
+                    <span className="flex items-center gap-1">
+                      <Globe className="h-3 w-3 text-purple-400/80" />
+                      <span>{regionLabel(acc.preferredRegion)}</span>
+                    </span>
+                    {typeof acc.creditExpiresInDays === 'number' && (
+                      <span className={acc.creditExpiresInDays <= 3 ? 'text-rose-400 font-bold' : 'text-amber-400/90 font-mono'}>
+                        {acc.creditExpiresInDays} روز
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
+
       </div>
 
       {/* 3. Top Metrics Cards Grid */}
@@ -236,7 +398,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         {/* Metric 1: Credit Balance */}
         <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] sm:text-xs font-medium text-neutral-400">اعتبار باقی‌مانده</span>
+            <span className="text-[11px] sm:text-xs font-medium text-neutral-400">
+              {activeAccountId === 'all' ? 'مجموع اعتبار کل هاب' : 'اعتبار باقی‌مانده'}
+            </span>
             <div className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-400 shrink-0">
               <Wallet className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
             </div>
@@ -257,25 +421,27 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         {/* Metric 2: Active Nodes */}
         <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] sm:text-xs font-medium text-neutral-400">نودها و سرویس‌ها</span>
+            <span className="text-[11px] sm:text-xs font-medium text-neutral-400">
+              {activeAccountId === 'all' ? 'کل نودها در تمام اکانت‌ها' : 'نودها و سرویس‌ها'}
+            </span>
             <div className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-xl bg-purple-500/10 text-purple-400 shrink-0">
               <Server className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
             </div>
           </div>
           <div className="mt-2.5">
             <div className="text-xl sm:text-2xl font-black text-white font-mono">
-              {healthyServicesCount}
+              {displayedServices.filter((s) => s.status === 'healthy').length}
               <span className="text-xs font-normal text-neutral-500 mr-1">
                 / {displayedServices.length}
               </span>
             </div>
             <div className="mt-1 flex items-center gap-1.5 text-[10px] sm:text-xs flex-wrap">
               <span className="text-emerald-400">
-                {healthyServicesCount} آنلاین
+                {displayedServices.filter((s) => s.status === 'healthy').length} آنلاین
               </span>
-              {crashedServicesCount > 0 && (
+              {displayedServices.filter((s) => s.status === 'crashed').length > 0 && (
                 <span className="text-rose-400">
-                  {crashedServicesCount} خطا
+                  {displayedServices.filter((s) => s.status === 'crashed').length} خطا
                 </span>
               )}
             </div>
@@ -285,7 +451,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         {/* Metric 3: Hourly Burn Rate */}
         <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] sm:text-xs font-medium text-neutral-400">نرخ مصرف ساعتی</span>
+            <span className="text-[11px] sm:text-xs font-medium text-neutral-400">
+              {activeAccountId === 'all' ? 'نرخ کل مصرف ساعتی' : 'نرخ مصرف ساعتی'}
+            </span>
             <div className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400 shrink-0">
               <Flame className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
             </div>
@@ -300,6 +468,42 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
           </div>
         </div>
 
+        {/* Metric 4: Scope / Accounts Breakdown */}
+        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] sm:text-xs font-medium text-neutral-400">
+              {activeAccountId === 'all' ? 'وضعیت اکانت‌های هاب' : 'اطلاعات اکانت فعال'}
+            </span>
+            <div className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-xl bg-sky-500/10 text-sky-400 shrink-0">
+              <Globe className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+            </div>
+          </div>
+          <div className="mt-2.5">
+            {activeAccountId === 'all' ? (
+              <>
+                <div className="text-xl sm:text-2xl font-black text-white font-mono flex items-baseline gap-1">
+                  <span>{accounts.length}</span>
+                  <span className="text-xs font-normal text-emerald-400 font-sans">اکانت متصل و همگام</span>
+                </div>
+                <div className="mt-1 flex items-center gap-1.5 text-[10px] sm:text-xs text-purple-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
+                  <span>نمای یکپارچه و جامع کل هاب</span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-base sm:text-lg font-black text-white truncate">
+                  {activeAccount?.name}
+                </div>
+                <div className="mt-1 flex items-center justify-between text-[10px] sm:text-xs text-neutral-400">
+                  <span>پلن: {activeAccount?.plan}</span>
+                  <span className="text-purple-300 font-mono">{regionLabel(activeAccount?.preferredRegion)}</span>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
       </div>
 
       {/* 4. Active Nodes Grid */}
@@ -307,76 +511,96 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         <div className="flex items-center justify-between mb-2.5">
           <div className="flex items-center gap-1.5">
             <Activity className="h-4 w-4 text-purple-400 shrink-0" />
-            <h2 className="text-xs sm:text-sm font-bold text-neutral-200">وضعیت نودها و سرویس‌های فعال</h2>
+            <h2 className="text-xs sm:text-sm font-bold text-neutral-200">
+              {activeAccountId === 'all'
+                ? `وضعیت تمام نودها (${displayedServices.length} سرویس در ${accounts.length} اکانت)`
+                : `نودها و سرویس‌های اکانت ${activeAccount?.name || ''}`}
+            </h2>
           </div>
           <button
             onClick={() => setActiveTab('nodes')}
             className="flex items-center gap-0.5 text-[11px] text-neutral-400 hover:text-white transition"
           >
-            همه
+            مدیریت نودها
             <ChevronLeft className="h-3.5 w-3.5" />
           </button>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-          {displayedServices.map((srv) => {
-            const isHealthy = srv.status === 'healthy';
-            const isStopped = srv.status === 'stopped';
-            const isCrashed = srv.status === 'crashed';
-            const isDeploying = srv.status === 'deploying';
+        {displayedServices.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-neutral-800 bg-neutral-900/30 p-6 text-center text-xs text-neutral-400">
+            هیچ سرویس فعالی در این بخش یافت نشد.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {displayedServices.map((srv) => {
+              const isHealthy = srv.status === 'healthy';
+              const isStopped = srv.status === 'stopped';
+              const isCrashed = srv.status === 'crashed';
+              const isDeploying = srv.status === 'deploying';
+              const serviceOwnerAccount = accounts.find((a) => a.id === srv.accountId);
 
-            return (
-              <div
-                key={srv.id}
-                className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-3.5 transition hover:border-neutral-700 backdrop-blur-md max-w-full overflow-hidden"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-neutral-800 text-base border border-neutral-700/50">
-                      <ServiceIcon icon={srv.icon} alt={srv.name} imgClassName="h-5 w-5" />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1">
-                        <span className="font-bold text-white text-xs sm:text-sm truncate">{srv.name}</span>
-                        {srv.domains.length > 0 && (
-                          <span className="text-[9px] text-neutral-500 font-mono shrink-0">
-                            :{srv.port}
-                          </span>
+              return (
+                <div
+                  key={srv.id}
+                  className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-3.5 transition hover:border-neutral-700 backdrop-blur-md max-w-full overflow-hidden"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-neutral-800 text-base border border-neutral-700/50">
+                        <ServiceIcon icon={srv.icon} alt={srv.name} imgClassName="h-5 w-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1">
+                          <span className="font-bold text-white text-xs sm:text-sm truncate">{srv.name}</span>
+                          {srv.domains.length > 0 && (
+                            <span className="text-[9px] text-neutral-500 font-mono shrink-0">
+                              :{srv.port}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[10px] text-neutral-400 truncate font-mono">
+                          {srv.imageOrRepo}
+                        </p>
+                        {/* Account Owner Badge when viewing All Accounts */}
+                        {activeAccountId === 'all' && serviceOwnerAccount && (
+                          <div className="flex items-center gap-1 text-[9px] text-neutral-400 mt-0.5">
+                            <div
+                              className="h-1.5 w-1.5 rounded-full shrink-0"
+                              style={{ backgroundColor: serviceOwnerAccount.color }}
+                            />
+                            <span className="truncate">{serviceOwnerAccount.name}</span>
+                          </div>
                         )}
                       </div>
-                      <p className="text-[10px] text-neutral-400 truncate font-mono">
-                        {srv.imageOrRepo}
-                      </p>
+                    </div>
+
+                    {/* Status badge */}
+                    <div className="shrink-0">
+                      {isHealthy && (
+                        <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[9px] font-semibold text-emerald-400 ring-1 ring-emerald-500/20">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                          آنلاین
+                        </span>
+                      )}
+                      {isDeploying && (
+                        <span className="flex items-center gap-1 rounded-full bg-purple-500/10 px-2 py-0.5 text-[9px] font-semibold text-purple-400 ring-1 ring-purple-500/20">
+                          <RotateCw className="h-3 w-3 animate-spin" />
+                          دپلوی
+                        </span>
+                      )}
+                      {isStopped && (
+                        <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-[9px] font-medium text-neutral-400">
+                          متوقف
+                        </span>
+                      )}
+                      {isCrashed && (
+                        <span className="flex items-center gap-1 rounded-full bg-rose-500/10 px-2 py-0.5 text-[9px] font-semibold text-rose-400 ring-1 ring-rose-500/20">
+                          <AlertOctagon className="h-3 w-3" />
+                          خطا
+                        </span>
+                      )}
                     </div>
                   </div>
-
-                  {/* Status badge */}
-                  <div className="shrink-0">
-                    {isHealthy && (
-                      <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[9px] font-semibold text-emerald-400 ring-1 ring-emerald-500/20">
-                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                        آنلاین
-                      </span>
-                    )}
-                    {isDeploying && (
-                      <span className="flex items-center gap-1 rounded-full bg-purple-500/10 px-2 py-0.5 text-[9px] font-semibold text-purple-400 ring-1 ring-purple-500/20">
-                        <RotateCw className="h-3 w-3 animate-spin" />
-                        دپلوی
-                      </span>
-                    )}
-                    {isStopped && (
-                      <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-[9px] font-medium text-neutral-400">
-                        متوقف
-                      </span>
-                    )}
-                    {isCrashed && (
-                      <span className="flex items-center gap-1 rounded-full bg-rose-500/10 px-2 py-0.5 text-[9px] font-semibold text-rose-400 ring-1 ring-rose-500/20">
-                        <AlertOctagon className="h-3 w-3" />
-                        خطا
-                      </span>
-                    )}
-                  </div>
-                </div>
 
                 {/* Metrics Gauges */}
                 <div className="mt-3 grid grid-cols-2 gap-2 rounded-xl bg-neutral-950/60 p-2 border border-neutral-800/50">
@@ -421,11 +645,11 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                       <RotateCw className="h-3.5 w-3.5" />
                     </button>
                     <button
-                      onClick={() => setActiveTab('logs')}
+                      onClick={() => setActiveTab('nodes')}
                       className="flex items-center gap-0.5 rounded-lg px-2 py-1 text-[10px] text-purple-400 hover:bg-purple-500/10 transition font-medium"
                     >
                       <Terminal className="h-3 w-3" />
-                      لاگ
+                      لاگ نود
                     </button>
                   </div>
                 </div>
@@ -433,79 +657,44 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             );
           })}
         </div>
+        )}
       </div>
 
-      {/* 5. Live Logs Preview & Quick Template Launch */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3.5 max-w-full overflow-hidden">
-        
-        {/* Left 2 Cols: Live Logs Stream Snippet */}
-        <div className="lg:col-span-2 rounded-2xl border border-neutral-800 bg-neutral-900/60 p-3.5 backdrop-blur-md max-w-full overflow-hidden">
-          <div className="flex items-center justify-between mb-2.5">
-            <div className="flex items-center gap-1.5">
-              <Terminal className="h-4 w-4 text-emerald-400 shrink-0" />
-              <h3 className="text-xs sm:text-sm font-bold text-white">لاگ‌های زنده نودها</h3>
-              <span className="flex h-2 w-2 rounded-full bg-emerald-400 animate-ping" />
-            </div>
-            <button
-              onClick={() => setActiveTab('logs')}
-              className="text-[11px] text-purple-400 hover:text-purple-300 font-medium"
-            >
-              کنسول کامل
-            </button>
+      {/* 5. Live Logs Preview */}
+      <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-3.5 backdrop-blur-md max-w-full overflow-hidden">
+        <div className="flex items-center justify-between mb-2.5">
+          <div className="flex items-center gap-1.5">
+            <Terminal className="h-4 w-4 text-emerald-400 shrink-0" />
+            <h3 className="text-xs sm:text-sm font-bold text-white">لاگ‌های زنده نودها</h3>
+            <span className="flex h-2 w-2 rounded-full bg-emerald-400 animate-ping" />
           </div>
-
-          <div className="rounded-xl bg-neutral-950 p-2.5 font-mono text-[10px] sm:text-[11px] space-y-1 border border-neutral-800/80 max-h-48 overflow-y-auto max-w-full">
-            {logs.slice(-5).map((log) => (
-              <div key={log.id} className="flex items-start gap-1.5 leading-relaxed break-all">
-                <span className="text-neutral-500 shrink-0 select-none">[{log.timestamp}]</span>
-                <span
-                  className={`font-semibold shrink-0 ${
-                    log.level === 'error'
-                      ? 'text-rose-400'
-                      : log.level === 'warn'
-                      ? 'text-amber-400'
-                      : 'text-purple-400'
-                  }`}
-                >
-                  [{log.serviceName}]
-                </span>
-                <span className="text-neutral-300 break-all">{log.message}</span>
-              </div>
-            ))}
-          </div>
+          <button
+            onClick={() => setActiveTab('nodes')}
+            className="text-[11px] text-purple-400 hover:text-purple-300 font-medium"
+          >
+            مدیریت در نودها
+          </button>
         </div>
 
-        {/* Right 1 Col: Quick Deploy Templates */}
-        <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-3.5 backdrop-blur-md max-w-full overflow-hidden">
-          <div className="flex items-center justify-between mb-2.5">
-            <div className="flex items-center gap-1.5">
-              <Zap className="h-4 w-4 text-amber-400 shrink-0" />
-              <h3 className="text-xs sm:text-sm font-bold text-white">دپلوی سریع تمپلیت</h3>
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            {TEMPLATES.slice(0, 3).map((tmpl) => (
-              <div
-                key={tmpl.id}
-                onClick={onOpenDeploy}
-                className="flex items-center justify-between p-2 rounded-xl border border-neutral-800/60 bg-neutral-950/40 hover:bg-neutral-800/50 hover:border-neutral-700 cursor-pointer transition"
+        <div className="rounded-xl bg-neutral-950 p-2.5 font-mono text-[10px] sm:text-[11px] space-y-1 border border-neutral-800/80 max-h-48 overflow-y-auto max-w-full">
+          {logs.slice(-5).map((log) => (
+            <div key={log.id} className="flex items-start gap-1.5 leading-relaxed break-all">
+              <span className="text-neutral-500 shrink-0 select-none">[{log.timestamp}]</span>
+              <span
+                className={`font-semibold shrink-0 ${
+                  log.level === 'error'
+                    ? 'text-rose-400'
+                    : log.level === 'warn'
+                    ? 'text-amber-400'
+                    : 'text-purple-400'
+                }`}
               >
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-base shrink-0">{tmpl.icon}</span>
-                  <div className="min-w-0">
-                    <h4 className="text-xs font-bold text-white truncate">{tmpl.name}</h4>
-                    <p className="text-[10px] text-neutral-400 truncate">{tmpl.description}</p>
-                  </div>
-                </div>
-                <button className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-neutral-800 text-neutral-300 hover:text-white hover:bg-purple-600 transition">
-                  <Plus className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            ))}
-          </div>
+                [{log.serviceName}]
+              </span>
+              <span className="text-neutral-300 break-all">{log.message}</span>
+            </div>
+          ))}
         </div>
-
       </div>
 
     </div>

@@ -42,6 +42,14 @@
   background: rgba(255, 255, 255, 0.25);
 }
 
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
 /* Terminal scanline effect */
 .terminal-grid {
   background-size: 24px 24px;
@@ -61,3 +69,4 @@
 .glow-rose {
   box-shadow: 0 0 25px -5px rgba(244, 63, 94, 0.25);
 }
+

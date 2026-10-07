@@ -243,6 +243,30 @@ export async function restartRailwayService(params: {
   }
 }
 
+/** Manual source update — re-pulls the current image tag (serviceInstanceRedeploy)
+ *  or deploys the latest commit (serviceInstanceDeploy + latestCommit). Unlike
+ *  redeployRailwayService, this resolves the source again instead of replaying
+ *  the old deployment, which is what actually picks up a new `:latest` image. */
+export async function manualUpdateRailwayService(params: {
+  token: string;
+  projectId: string;
+  serviceId: string;
+  environmentId?: string;
+}) {
+  try {
+    const res = await fetch('/api/railway/service/manual-update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+    data.httpStatus = res.status;
+    return data;
+  } catch (err: any) {
+    return { errors: [{ message: err.message || 'Manual source update failed' }] };
+  }
+}
+
 /** Queues a new deployment from the same source (deploymentRedeploy). */
 export async function redeployRailwayService(params: {
   token: string;
@@ -573,6 +597,42 @@ export async function createRailwayVolume(params: {
     return await res.json();
   } catch (err: any) {
     return { errors: [{ message: err.message || 'Volume creation failed' }] };
+  }
+}
+
+/** Deletes a persistent volume (volumeDelete). The data on the disk goes with it. */
+export async function deleteRailwayVolume(params: { token: string; volumeId: string }) {
+  try {
+    const res = await fetch('/api/railway/volume/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+    data.httpStatus = res.status;
+    return data;
+  } catch (err: any) {
+    return { errors: [{ message: err.message || 'Volume deletion failed' }] };
+  }
+}
+
+/** Volume instances of an environment (state / serviceId / isPendingDeletion /
+ *  mountPath / size) — `project.volumes` carries none of that. */
+export async function getRailwayVolumeInstances(params: {
+  token: string;
+  environmentId: string;
+}) {
+  try {
+    const res = await fetch('/api/railway/volume/instances', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+    data.httpStatus = res.status;
+    return data;
+  } catch (err: any) {
+    return { errors: [{ message: err.message || 'Failed to fetch volume instances' }] };
   }
 }
 
