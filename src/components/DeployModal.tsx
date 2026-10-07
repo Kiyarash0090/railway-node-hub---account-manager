@@ -15,7 +15,7 @@ import {
   Copy,
   Check,
 } from 'lucide-react';
-import { useHub } from '../context/HubContext';
+import { useHub, useBackHandler } from '../context/HubContext';
 import { normalizeGitHubRepo, extractApiError } from '../utils/githubRepo';
 import { RailwayServiceDomain } from '../types';
 import {
@@ -34,6 +34,8 @@ interface DeployModalProps {
 }
 
 export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => {
+  useBackHandler(isOpen, onClose);
+
   const {
     accounts,
     activeAccountId,
@@ -540,8 +542,8 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
-      <div className="w-[96vw] max-w-3xl rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-6 shadow-2xl overflow-y-auto max-h-[92vh]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md modal-backdrop-anim">
+      <div className="w-[96vw] max-w-3xl rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-6 shadow-2xl overflow-y-auto max-h-[92vh] modal-content-anim">
 
         {/* Modal Header */}
         <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">

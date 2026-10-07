@@ -25,7 +25,7 @@ import {
   Rocket,
   DownloadCloud,
 } from 'lucide-react';
-import { useHub } from '../context/HubContext';
+import { useHub, useBackHandler } from '../context/HubContext';
 import { RailwayService, RailwayProject, RailwayServiceDomain, domainLabel } from '../types';
 import {
   createRailwayProject,
@@ -223,6 +223,16 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
   const [volumeInstances, setVolumeInstances] = useState<any[] | null>(null);
   const [isLoadingInstances, setIsLoadingInstances] = useState(false);
   const [instancesError, setInstancesError] = useState<string | null>(null);
+
+  // Mobile Back Button: close active modal/drawer before navigating back or exiting
+  useBackHandler(isNewProjectModalOpen, () => setIsNewProjectModalOpen(false));
+  useBackHandler(Boolean(selectedEnvService), () => setSelectedEnvService(null));
+  useBackHandler(Boolean(selectedDomainService), () => setSelectedDomainService(null));
+  useBackHandler(Boolean(selectedBuildConfigService), () => setSelectedBuildConfigService(null));
+  useBackHandler(Boolean(selectedVolumeService), () => setSelectedVolumeService(null));
+  useBackHandler(Boolean(selectedLogService), () => setSelectedLogService(null));
+  useBackHandler(Boolean(volumeProjectId), () => setVolumeProjectId(null));
+  useBackHandler(Boolean(confirmDeleteId), () => setConfirmDeleteId(null));
 
   // Target Account & Project
   const targetAccount = accounts.find((a) => a.id === activeAccountId) || accounts[0];

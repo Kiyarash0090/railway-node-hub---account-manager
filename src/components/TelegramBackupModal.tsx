@@ -36,10 +36,10 @@ const inputClass =
   'w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-xs text-white placeholder:text-neutral-600 focus:border-sky-500/50 focus:outline-none transition';
 
 const secondaryBtn =
-  'flex items-center justify-center gap-1.5 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-xs font-bold text-neutral-200 hover:border-neutral-700 hover:bg-neutral-800 transition disabled:opacity-40 disabled:cursor-not-allowed';
+  'flex items-center justify-center gap-1.5 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-xs font-bold text-neutral-200 hover:border-neutral-700 hover:bg-neutral-800 transition disabled:opacity-40 disabled:cursor-not-allowed btn-press';
 
 const primaryBtn =
-  'flex items-center justify-center gap-1.5 rounded-xl bg-sky-500 px-3 py-2 text-xs font-bold text-white hover:bg-sky-600 transition disabled:opacity-40 disabled:cursor-not-allowed';
+  'flex items-center justify-center gap-1.5 rounded-xl bg-sky-500 px-3 py-2 text-xs font-bold text-white hover:bg-sky-600 transition disabled:opacity-40 disabled:cursor-not-allowed btn-press';
 
 export const TelegramBackupModal: React.FC<TelegramBackupModalProps> = ({ isOpen, onClose }) => {
   const [config, setConfig] = useState<TelegramConfig | null>(null);
@@ -185,8 +185,8 @@ export const TelegramBackupModal: React.FC<TelegramBackupModalProps> = ({ isOpen
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 backdrop-blur-md animate-in fade-in">
-      <div className="w-[94vw] max-w-2xl rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-6 shadow-2xl overflow-y-auto max-h-[90vh]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 backdrop-blur-md modal-backdrop-anim">
+      <div className="w-[94vw] max-w-2xl rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-6 shadow-2xl overflow-y-auto max-h-[90vh] modal-content-anim">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
           <div className="flex items-center gap-2">

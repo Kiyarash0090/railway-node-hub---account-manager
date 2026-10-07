@@ -11,6 +11,7 @@ import {
   Play,
   RotateCw,
   AlertOctagon,
+  AlertCircle,
   ChevronLeft,
   ChevronRight,
   Layers,
@@ -29,7 +30,7 @@ interface OverviewDashboardProps {
   onOpenAddAccount: () => void;
 }
 
-type AccountFilter = 'all' | 'with-services' | 'low-credit';
+type AccountFilter = 'all' | 'with-services' | 'low-credit' | 'depleted';
 
 export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
   onOpenAddAccount,
@@ -68,7 +69,8 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
     return accounts.filter((acc) => {
       const nodeCount = acc.projects.filter((p) => !p.isDeletedOnRailway && p.isExternal).reduce((s, p) => s + p.services.length, 0);
       if (statusFilter === 'with-services' && nodeCount === 0) return false;
-      if (statusFilter === 'low-credit' && acc.creditRemaining >= 0.5) return false;
+      if (statusFilter === 'depleted' && acc.creditRemaining > 0) return false;
+      if (statusFilter === 'low-credit' && (acc.creditRemaining >= 0.5 || acc.creditRemaining <= 0)) return false;
 
       const q = searchQuery.trim().toLowerCase();
       if (!q) return true;
@@ -196,20 +198,25 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
           </div>
         </div>
 
-        {/* Status Filter Chips (when accounts > 4) */}
-        {accounts.length > 4 && (
+        {/* Status Filter Chips (when accounts > 3 or when there are depleted accounts) */}
+        {(accounts.length > 3 || accounts.some((a) => a.creditRemaining <= 0)) && (
           <div className="flex items-center gap-1.5 pt-2.5 overflow-x-auto no-scrollbar">
             {[
               { id: 'all', label: 'همه اکانت‌ها', count: accounts.length },
               { id: 'with-services', label: 'دارای سرویس', count: accounts.filter((a) => a.projects.some(p => !p.isDeletedOnRailway && p.isExternal && p.services.length > 0)).length },
-              { id: 'low-credit', label: 'کم‌اعتبار (<$0.5)', count: accounts.filter((a) => a.creditRemaining < 0.5).length },
+              ...(accounts.some((a) => a.creditRemaining <= 0)
+                ? [{ id: 'depleted', label: 'اتمام موجودی', count: accounts.filter((a) => a.creditRemaining <= 0).length }]
+                : []),
+              { id: 'low-credit', label: 'کم‌اعتبار (<$0.5)', count: accounts.filter((a) => a.creditRemaining > 0 && a.creditRemaining < 0.5).length },
             ].map((f) => (
               <button
                 key={f.id}
                 onClick={() => setStatusFilter(f.id as AccountFilter)}
                 className={`flex items-center gap-1 rounded-lg px-2 py-0.5 text-[10px] font-medium transition shrink-0 ${
                   statusFilter === f.id
-                    ? 'bg-purple-600/30 border border-purple-500/50 text-purple-200'
+                    ? f.id === 'depleted'
+                      ? 'bg-rose-600/30 border border-rose-500/50 text-rose-200'
+                      : 'bg-purple-600/30 border border-purple-500/50 text-purple-200'
                     : 'bg-neutral-950/60 border border-neutral-800/80 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50'
                 }`}
               >
@@ -249,7 +256,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             {/* Special First Card: "All Accounts / نمای کل هاب" */}
             <div
               onClick={() => setActiveAccountId('all')}
-              className={`cursor-pointer rounded-2xl p-3 transition-all duration-200 border min-w-[190px] sm:min-w-[215px] max-w-[230px] shrink-0 flex flex-col justify-between select-none ${
+              className={`cursor-pointer rounded-2xl p-3 transition-all duration-200 border min-w-[190px] sm:min-w-[215px] max-w-[230px] shrink-0 flex flex-col justify-between select-none card-hover btn-press ${
                 activeAccountId === 'all'
                   ? 'bg-purple-950/40 border-purple-500/70 ring-2 ring-purple-500/30 shadow-lg shadow-purple-500/10'
                   : 'bg-neutral-950/60 border-neutral-800/90 hover:border-neutral-700 hover:bg-neutral-900/60'
@@ -300,7 +307,8 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
 
             {/* Individual Account Cards in Carousel */}
             {filteredAccounts.map((acc) => {
-              const isLow = acc.creditRemaining < 0.5;
+              const isDepleted = acc.creditRemaining <= 0;
+              const isLow = !isDepleted && acc.creditRemaining < 0.5;
               const isSelected = activeAccountId === acc.id;
               const percent = Math.max(0, Math.min(100, (acc.creditRemaining / (acc.creditLimit || 1)) * 100));
               const nodeCount = acc.projects.filter((p) => !p.isDeletedOnRailway && p.isExternal).reduce((s, p) => s + p.services.length, 0);
@@ -309,24 +317,36 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                 <div
                   key={acc.id}
                   onClick={() => setActiveAccountId(acc.id)}
-                  className={`cursor-pointer rounded-2xl p-3 transition-all duration-200 border min-w-[200px] sm:min-w-[230px] max-w-[250px] shrink-0 flex flex-col justify-between select-none ${
+                  className={`cursor-pointer rounded-2xl p-3 transition-all duration-200 border min-w-[200px] sm:min-w-[230px] max-w-[250px] shrink-0 flex flex-col justify-between select-none card-hover btn-press ${
                     isSelected
-                      ? 'bg-neutral-900/95 border-purple-500/70 ring-2 ring-purple-500/30 shadow-lg shadow-purple-500/10'
-                      : 'bg-neutral-950/60 border-neutral-800/90 hover:border-neutral-700 hover:bg-neutral-900/60'
+                      ? isDepleted
+                        ? 'bg-rose-950/30 border-rose-500/70 ring-2 ring-rose-500/40 shadow-lg shadow-rose-500/10'
+                        : 'bg-neutral-900/95 border-purple-500/70 ring-2 ring-purple-500/30 shadow-lg shadow-purple-500/10'
+                      : isDepleted
+                        ? 'bg-rose-950/15 border-rose-500/30 hover:border-rose-500/50 hover:bg-rose-950/25'
+                        : 'bg-neutral-950/60 border-neutral-800/90 hover:border-neutral-700 hover:bg-neutral-900/60'
                   }`}
                 >
                   <div>
                     {/* Top row: Avatar, Name & Status */}
                     <div className="flex items-center justify-between gap-1 mb-2">
                       <div className="flex items-center gap-2 min-w-0">
-                        <div
-                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white font-black text-xs shadow-sm"
-                          style={{ backgroundColor: acc.color }}
-                        >
-                          {acc.name.charAt(0).toUpperCase()}
+                        <div className="relative shrink-0">
+                          <div
+                            className="flex h-7 w-7 items-center justify-center rounded-lg text-white font-black text-xs shadow-sm"
+                            style={{ backgroundColor: acc.color }}
+                          >
+                            {acc.name.charAt(0).toUpperCase()}
+                          </div>
+                          {isDepleted && (
+                            <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
+                              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-75"></span>
+                              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-rose-500"></span>
+                            </span>
+                          )}
                         </div>
                         <div className="min-w-0">
-                          <span className="text-xs font-bold text-white truncate block group-hover:text-purple-300 transition">
+                          <span className={`text-xs font-bold truncate block transition ${isDepleted ? 'text-rose-200' : 'text-white group-hover:text-purple-300'}`}>
                             {acc.name}
                           </span>
                           <span className="text-[10px] text-neutral-400 font-mono truncate block">
@@ -339,6 +359,11 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                         <span className="rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 px-1.5 py-0.2 text-[9px] font-bold shrink-0">
                           انتخاب
                         </span>
+                      ) : isDepleted ? (
+                        <span className="rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40 px-1.5 py-0.2 text-[9px] font-bold shrink-0 flex items-center gap-1">
+                          <AlertCircle className="h-2.5 w-2.5 text-rose-400" />
+                          <span>اتمام موجودی</span>
+                        </span>
                       ) : (
                         <span className="rounded-full bg-neutral-900 px-1.5 py-0.2 text-[9px] text-neutral-400 border border-neutral-800 shrink-0">
                           {acc.plan}
@@ -349,7 +374,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                     {/* Middle row: Balance & Progress */}
                     <div className="mt-1 flex items-baseline justify-between font-mono">
                       <div>
-                        <span className={`text-base sm:text-lg font-black ${isLow ? 'text-rose-400' : 'text-emerald-400'}`}>
+                        <span className={`text-base sm:text-lg font-black ${isDepleted ? 'text-rose-400' : isLow ? 'text-amber-400' : 'text-emerald-400'}`}>
                           ${acc.creditRemaining.toFixed(2)}
                         </span>
                         <span className="text-[9px] text-neutral-500 mr-1">/ ${acc.creditLimit}</span>
@@ -363,7 +388,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
                     <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-neutral-900 border border-neutral-800">
                       <div
                         className={`h-full rounded-full transition-all duration-500 ${
-                          isLow
+                          isDepleted
+                            ? 'bg-rose-500'
+                            : isLow
                             ? 'bg-amber-500'
                             : 'bg-emerald-500'
                         }`}
@@ -396,7 +423,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4 max-w-full overflow-hidden">
         
         {/* Metric 1: Credit Balance */}
-        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md">
+        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md card-hover">
           <div className="flex items-center justify-between">
             <span className="text-[11px] sm:text-xs font-medium text-neutral-400">
               {activeAccountId === 'all' ? 'مجموع اعتبار کل هاب' : 'اعتبار باقی‌مانده'}
@@ -419,7 +446,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         </div>
 
         {/* Metric 2: Active Nodes */}
-        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md">
+        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md card-hover">
           <div className="flex items-center justify-between">
             <span className="text-[11px] sm:text-xs font-medium text-neutral-400">
               {activeAccountId === 'all' ? 'کل نودها در تمام اکانت‌ها' : 'نودها و سرویس‌ها'}
@@ -449,7 +476,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         </div>
 
         {/* Metric 3: Hourly Burn Rate */}
-        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md">
+        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md card-hover">
           <div className="flex items-center justify-between">
             <span className="text-[11px] sm:text-xs font-medium text-neutral-400">
               {activeAccountId === 'all' ? 'نرخ کل مصرف ساعتی' : 'نرخ مصرف ساعتی'}
@@ -469,7 +496,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         </div>
 
         {/* Metric 4: Scope / Accounts Breakdown */}
-        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md">
+        <div className="rounded-2xl border border-neutral-800/80 bg-neutral-900/60 p-3.5 sm:p-5 backdrop-blur-md card-hover">
           <div className="flex items-center justify-between">
             <span className="text-[11px] sm:text-xs font-medium text-neutral-400">
               {activeAccountId === 'all' ? 'وضعیت اکانت‌های هاب' : 'اطلاعات اکانت فعال'}

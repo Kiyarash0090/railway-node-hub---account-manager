@@ -77,11 +77,11 @@ export const AccountMenuModal: React.FC<AccountMenuModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/70 p-4 backdrop-blur-md animate-in fade-in duration-200" dir="rtl">
+    <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/70 p-4 backdrop-blur-md modal-backdrop-anim" dir="rtl">
       {/* Backdrop click to close */}
       <div className="fixed inset-0" onClick={resetForm} />
 
-      <div className="relative w-full max-w-md rounded-3xl border border-neutral-800 bg-neutral-900/98 p-6 shadow-2xl backdrop-blur-2xl ring-1 ring-white/10 z-10" onClick={(e) => e.stopPropagation()}>
+      <div className="relative w-full max-w-md rounded-3xl border border-neutral-800 bg-neutral-900/98 p-6 shadow-2xl backdrop-blur-2xl ring-1 ring-white/10 z-10 modal-content-anim" onClick={(e) => e.stopPropagation()}>
         
         {/* Header */}
         <div className="flex items-center justify-between pb-4 border-b border-neutral-800">

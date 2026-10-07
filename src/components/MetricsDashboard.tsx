@@ -168,7 +168,7 @@ export const MetricsDashboard: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3.5 max-w-full overflow-hidden">
           
           {/* Chart 1: CPU Utilization */}
-          <div className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-4 sm:p-5 backdrop-blur-md max-w-full overflow-hidden">
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-4 sm:p-5 backdrop-blur-md max-w-full overflow-hidden card-hover">
             <div className="flex items-center justify-between border-b border-neutral-800/80 pb-2.5 mb-3">
               <div className="flex items-center gap-2 min-w-0">
                 <div className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-xl bg-purple-500/10 text-purple-400 shrink-0">
@@ -195,7 +195,7 @@ export const MetricsDashboard: React.FC = () => {
           </div>
 
           {/* Chart 2: Memory (RAM) Usage */}
-          <div className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-4 sm:p-5 backdrop-blur-md max-w-full overflow-hidden">
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-4 sm:p-5 backdrop-blur-md max-w-full overflow-hidden card-hover">
             <div className="flex items-center justify-between border-b border-neutral-800/80 pb-2.5 mb-3">
               <div className="flex items-center gap-2 min-w-0">
                 <div className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-xl bg-indigo-500/10 text-indigo-400 shrink-0">
@@ -224,7 +224,7 @@ export const MetricsDashboard: React.FC = () => {
           </div>
 
           {/* Chart 3: Requests / Second */}
-          <div className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-4 sm:p-5 backdrop-blur-md max-w-full overflow-hidden">
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-4 sm:p-5 backdrop-blur-md max-w-full overflow-hidden card-hover">
             <div className="flex items-center justify-between border-b border-neutral-800/80 pb-2.5 mb-3">
               <div className="flex items-center gap-2 min-w-0">
                 <div className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-400 shrink-0">
@@ -247,7 +247,7 @@ export const MetricsDashboard: React.FC = () => {
           </div>
 
           {/* Summary Box: Node Hardware Spec */}
-          <div className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-4 sm:p-5 backdrop-blur-md flex flex-col justify-between max-w-full overflow-hidden">
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-900/70 p-4 sm:p-5 backdrop-blur-md flex flex-col justify-between max-w-full overflow-hidden card-hover">
             <div>
               <div className="flex items-center gap-2 border-b border-neutral-800/80 pb-2.5 mb-3">
                 <Server className="h-4 w-4 text-purple-400 shrink-0" />

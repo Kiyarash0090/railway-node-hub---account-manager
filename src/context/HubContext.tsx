@@ -70,6 +70,11 @@ interface HubContextType {
   serviceDeployStates: Record<string, ServiceDeployState>;
   setServiceDeployState: (serviceId: string, state: ServiceDeployState | null) => void;
 
+  // Mobile Back Button Navigation
+  registerBackHandler: (handler: () => boolean | void) => () => void;
+  goBack: () => boolean;
+  showExitToast: boolean;
+
   // Account Actions
   setActiveAccountId: (id: string) => void;
   setActiveTab: (tab: 'dashboard' | 'accounts' | 'nodes' | 'metrics' | 'alerts') => void;
@@ -152,8 +157,8 @@ const DEPLOY_DONE_TTL_MS = 10_000;
 /** A "running" job nobody can finish any more (tab closed mid-build) expires. */
 const DEPLOY_JOB_MAX_RUNNING_MS = 30 * 60_000;
 const SERVICE_DEPLOY_MAX_RUNNING_MS = 60 * 60_000;
-const HUB_TABS = ['dashboard', 'accounts', 'nodes', 'metrics', 'alerts'] as const;
-type HubTab = (typeof HUB_TABS)[number];
+export const HUB_TABS = ['dashboard', 'accounts', 'nodes', 'metrics', 'alerts'] as const;
+export type HubTab = (typeof HUB_TABS)[number];
 
 export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // 1. Accounts State (loaded from server after auth)
@@ -169,13 +174,101 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return 'all';
     }
   });
-  const [activeTab, setActiveTab] = useState<HubTab>(() => {
+  const [activeTab, setActiveTabState] = useState<HubTab>(() => {
     try {
       const saved = localStorage.getItem(ACTIVE_TAB_STORAGE_KEY);
       if (saved && (HUB_TABS as readonly string[]).includes(saved)) return saved as HubTab;
     } catch (e) {}
     return 'dashboard';
   });
+
+  // Mobile Back Button & Tab Navigation History
+  const tabHistoryRef = useRef<HubTab[]>([]);
+  const backHandlersRef = useRef<Array<() => boolean | void>>([]);
+  const [showExitToast, setShowExitToast] = useState(false);
+
+  const registerBackHandler = useCallback((handler: () => boolean | void) => {
+    backHandlersRef.current.push(handler);
+    return () => {
+      backHandlersRef.current = backHandlersRef.current.filter((h) => h !== handler);
+    };
+  }, []);
+
+  const setActiveTab = useCallback((nextTab: HubTab) => {
+    setActiveTabState((prev) => {
+      if (prev !== nextTab) {
+        const last = tabHistoryRef.current[tabHistoryRef.current.length - 1];
+        if (last !== prev) {
+          tabHistoryRef.current.push(prev);
+          if (tabHistoryRef.current.length > 25) {
+            tabHistoryRef.current.shift();
+          }
+        }
+      }
+      return nextTab;
+    });
+  }, []);
+
+  const goBack = useCallback(() => {
+    // 1. If any modal / popup / menu has registered a back handler, close the most recent one
+    if (backHandlersRef.current.length > 0) {
+      const handler = backHandlersRef.current.pop();
+      if (handler) {
+        handler();
+        return true;
+      }
+    }
+
+    // 2. If no modal is open, go back to previous tab
+    if (tabHistoryRef.current.length > 0) {
+      const prevTab = tabHistoryRef.current.pop();
+      if (prevTab) {
+        setActiveTabState(prevTab);
+        return true;
+      }
+    }
+
+    // 3. At root tab with no modals
+    return false;
+  }, []);
+
+  useEffect(() => {
+    // Push an initial history entry so hardware back button can be intercepted
+    try {
+      window.history.pushState({ hub: 'root' }, '');
+    } catch (e) {}
+
+    let lastBackPress = 0;
+
+    const onPopState = () => {
+      const handled = goBack();
+      if (handled) {
+        // Re-push state so back button remains trapped and armed inside app
+        try {
+          window.history.pushState({ hub: 'step' }, '');
+        } catch (e) {}
+      } else {
+        // At root screen with no open modal and no tab history
+        const now = Date.now();
+        if (now - lastBackPress < 2000) {
+          // Double back press within 2 seconds: let user exit!
+          window.history.back();
+        } else {
+          lastBackPress = now;
+          setShowExitToast(true);
+          setTimeout(() => setShowExitToast(false), 2000);
+          try {
+            window.history.pushState({ hub: 'root' }, '');
+          } catch (e) {}
+        }
+      }
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+    };
+  }, [goBack]);
 
   // 2. Alerts
   const [alerts, setAlerts] = useState<AlertNotification[]>([]);
@@ -1349,6 +1442,9 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setDeployJob,
     serviceDeployStates,
     setServiceDeployState,
+    registerBackHandler,
+    goBack,
+    showExitToast,
     setActiveAccountId,
     setActiveTab,
     toggleTheme,
@@ -1391,3 +1487,19 @@ export const useHub = () => {
   }
   return context;
 };
+
+/**
+ * Convenient declarative hook for modals, popups, and dropdown menus.
+ * Automatically registers the close callback with the mobile back button stack
+ * when `isOpen` is true, and unregisters when closed.
+ */
+export function useBackHandler(isOpen: boolean, onClose: () => void) {
+  const { registerBackHandler } = useHub();
+  useEffect(() => {
+    if (!isOpen) return;
+    return registerBackHandler(() => {
+      onClose();
+      return true;
+    });
+  }, [isOpen, onClose, registerBackHandler]);
+}

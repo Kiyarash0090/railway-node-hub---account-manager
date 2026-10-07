@@ -17,7 +17,7 @@ import {
   Sparkles,
   ArrowUpDown,
 } from 'lucide-react';
-import { useHub } from '../context/HubContext';
+import { useHub, useBackHandler } from '../context/HubContext';
 import { regionLabel, RAILWAY_REGIONS } from '../types';
 import { setRailwayRegion } from '../services/railwayApi';
 import { extractApiError } from '../utils/githubRepo';
@@ -62,6 +62,11 @@ export const AccountsManager: React.FC<AccountsManagerProps> = ({
   const [editingTagsId, setEditingTagsId] = useState<string | null>(null);
   const [tagDraft, setTagDraft] = useState('');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // Mobile Back Button: close add drawer, tag editor, or delete confirm
+  useBackHandler(isAdding && accounts.length > 0, () => setIsAdding(false));
+  useBackHandler(Boolean(editingTagsId), () => setEditingTagsId(null));
+  useBackHandler(Boolean(confirmDeleteId), () => setConfirmDeleteId(null));
 
   React.useEffect(() => {
     if (accounts.length === 0) {
@@ -505,7 +510,8 @@ export const AccountsManager: React.FC<AccountsManagerProps> = ({
         <div className="space-y-3.5">
           {processedAccounts.map((acc) => {
             const isSelected = activeAccountId === acc.id;
-            const isLowCredit = acc.creditRemaining < 0.5;
+            const isDepleted = acc.creditRemaining <= 0;
+            const isLowCredit = !isDepleted && acc.creditRemaining < 0.5;
             const percentageRemaining = Math.max(0, Math.min(100, (acc.creditRemaining / (acc.creditLimit || 1)) * 100));
             const isEditingTags = editingTagsId === acc.id;
 
@@ -514,8 +520,12 @@ export const AccountsManager: React.FC<AccountsManagerProps> = ({
                 key={acc.id}
                 className={`rounded-2xl border p-4 sm:p-5 transition-all duration-200 backdrop-blur-md max-w-full overflow-hidden ${
                   isSelected
-                    ? 'bg-neutral-900/95 border-purple-500/50 ring-1 ring-purple-500/30'
-                    : 'bg-neutral-900/60 border-neutral-800 hover:border-neutral-700'
+                    ? isDepleted
+                      ? 'bg-neutral-900/95 border-rose-500/60 ring-1 ring-rose-500/40'
+                      : 'bg-neutral-900/95 border-purple-500/50 ring-1 ring-purple-500/30'
+                    : isDepleted
+                      ? 'bg-neutral-900/60 border-rose-500/30 hover:border-rose-500/50'
+                      : 'bg-neutral-900/60 border-neutral-800 hover:border-neutral-700'
                 }`}
               >
                 <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
@@ -523,21 +533,38 @@ export const AccountsManager: React.FC<AccountsManagerProps> = ({
                   {/* Account details */}
                   <div className="flex items-start gap-3 min-w-0 max-w-full">
                     <div
-                      className="flex h-10 w-10 sm:h-12 sm:w-12 shrink-0 items-center justify-center rounded-2xl text-white font-bold text-base sm:text-lg shadow-md"
+                      className="relative flex h-10 w-10 sm:h-12 sm:w-12 shrink-0 items-center justify-center rounded-2xl text-white font-bold text-base sm:text-lg shadow-md"
                       style={{ backgroundColor: acc.color }}
                     >
                       {acc.name.charAt(0).toUpperCase()}
+                      {isDepleted && (
+                        <span className="absolute -top-1 -right-1 flex h-3 w-3">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-75"></span>
+                          <span className="relative inline-flex h-3 w-3 rounded-full bg-rose-500"></span>
+                        </span>
+                      )}
                     </div>
                     <div className="min-w-0 max-w-full">
                       <div className="flex items-center gap-1.5 flex-wrap">
-                        <h3 className="font-extrabold text-white text-sm sm:text-base truncate">{acc.name}</h3>
+                        <h3 className={`font-extrabold text-sm sm:text-base truncate ${isDepleted ? 'text-rose-200' : 'text-white'}`}>{acc.name}</h3>
                         <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-[10px] font-medium text-neutral-300 shrink-0">
                           {acc.plan}
                         </span>
-                        <span className="rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 text-[9px] font-medium flex items-center gap-1 shrink-0">
-                          <CheckCircle2 className="h-3 w-3" />
-                          فعال
-                        </span>
+                        {isDepleted ? (
+                          <span className="rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/35 px-2 py-0.5 text-[9px] font-bold flex items-center gap-1 shrink-0">
+                            <AlertCircle className="h-3 w-3 text-rose-400" />
+                            اتمام موجودی
+                          </span>
+                        ) : isLowCredit ? (
+                          <span className="rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 px-2 py-0.5 text-[9px] font-medium flex items-center gap-1 shrink-0">
+                            کم‌اعتبار
+                          </span>
+                        ) : (
+                          <span className="rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 text-[9px] font-medium flex items-center gap-1 shrink-0">
+                            <CheckCircle2 className="h-3 w-3" />
+                            فعال
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center gap-2 text-[11px] text-neutral-400 mt-1 flex-wrap">
                         <span className="font-mono text-neutral-300 truncate max-w-[150px] sm:max-w-none">{acc.email}</span>
@@ -632,7 +659,7 @@ export const AccountsManager: React.FC<AccountsManagerProps> = ({
                       <div className="text-[10px] text-neutral-400">اعتبار باقی‌مانده:</div>
                       <div
                         className={`text-base sm:text-xl font-black font-mono ${
-                          isLowCredit ? 'text-rose-400' : 'text-emerald-400'
+                          isDepleted ? 'text-rose-400' : isLowCredit ? 'text-amber-400' : 'text-emerald-400'
                         }`}
                       >
                         ${acc.creditRemaining.toFixed(2)}
