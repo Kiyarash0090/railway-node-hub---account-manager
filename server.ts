@@ -44,7 +44,35 @@ globalThis.fetch = (async (input: any, init?: any) => {
     // Headers constructor can fail on exotic inputs — fall through unchanged.
   }
 
-  // One extra attempt: mid-flight ISP drops are common on this network.
+  // Retries: mid-flight ISP drops are common on this network, and the IPv6
+  // routes Cloudflare advertises are often blocked outright (EACCES /
+  // ENETUNREACH). Those arrive wrapped in an AggregateError, so the whole
+  // error tree has to be inspected — a single `cause.code` missed them and the
+  // sync surfaced as an unreachable-Railway 502 while a browser succeeded.
+  const collectCodes = (err: any, out = new Set<string>(), depth = 0): Set<string> => {
+    if (!err || depth > 4) return out;
+    if (typeof err.code === 'string') out.add(err.code);
+    if (err.cause) collectCodes(err.cause, out, depth + 1);
+    if (Array.isArray(err.errors)) {
+      for (const inner of err.errors) collectCodes(inner, out, depth + 1);
+    }
+    return out;
+  };
+
+  const TRANSIENT_CODES = new Set([
+    'ETIMEDOUT',
+    'ECONNRESET',
+    'ENOTFOUND',
+    'ECONNREFUSED',
+    'EAI_AGAIN',
+    'EPIPE',
+    'EACCES',
+    'ENETUNREACH',
+    'EHOSTUNREACH',
+    'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_SOCKET',
+  ]);
+
   const maxAttempts = 4;
   let lastErr: any;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -52,16 +80,14 @@ globalThis.fetch = (async (input: any, init?: any) => {
       return await railwayFetchBase(input, opts);
     } catch (err: any) {
       lastErr = err;
-      const code = err?.cause?.code || err?.code || '';
-      const isTransient =
-        code === 'ETIMEDOUT' ||
-        code === 'ECONNRESET' ||
-        code === 'ENOTFOUND' ||
-        code === 'ECONNREFUSED' ||
-        code === 'EAI_AGAIN' ||
-        code === 'EPIPE';
+      const codes = collectCodes(err);
+      // No HTTP response at all means the request never reached Railway — that
+      // is a transport failure, worth retrying whatever its code.
+      const isTransient = [...codes].some((c) => TRANSIENT_CODES.has(c)) || codes.size === 0;
       if (!isTransient || attempt === maxAttempts) throw err;
-      await new Promise((r) => setTimeout(r, 400 * attempt));
+      // The network prefers IPv6 in some DNS answers; a failed IPv6 attempt
+      // usually succeeds immediately on the next try.
+      await new Promise((r) => setTimeout(r, 300 * attempt));
     }
   }
   throw lastErr;
@@ -355,6 +381,44 @@ async function startServer() {
 
 
   /** Real domains for one service (service + custom), with Railway ids and ports. */
+  /** A service's variables, minus Railway's own RAILWAY_* entries. Returns an
+   *  empty map on any failure so a sync never breaks over one service. */
+  async function fetchServiceVariables(
+    token: string,
+    projectId: string,
+    serviceId: string,
+    environmentId: string
+  ): Promise<Record<string, string>> {
+    if (!projectId || !serviceId || !environmentId) return {};
+    try {
+      const query = `
+        query GetServiceVariables($projectId: String!, $environmentId: String!, $serviceId: String!) {
+          variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId)
+        }
+      `;
+      const response = await fetch('https://backboard.railway.app/graphql/v2', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token.trim()}`,
+        },
+        body: JSON.stringify({ query, variables: { projectId, environmentId, serviceId } }),
+      });
+      const data = await response.json();
+      const vars = data?.data?.variables;
+      if (!vars || typeof vars !== 'object' || Array.isArray(vars)) return {};
+
+      const out: Record<string, string> = {};
+      for (const [key, value] of Object.entries(vars)) {
+        if (/^RAILWAY_/i.test(key)) continue;
+        out[key] = value === null || value === undefined ? '' : String(value);
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
   async function fetchServiceDomains(
     token: string,
     projectId: string,
@@ -671,6 +735,16 @@ async function startServer() {
                         id
                         name
                         icon
+                        serviceInstances {
+                          edges {
+                            node {
+                              source {
+                                repo
+                                image
+                              }
+                            }
+                          }
+                        }
                       }
                     }
                   }
@@ -728,6 +802,18 @@ async function startServer() {
           );
         });
 
+        // Real service variables, so the variables modal shows what Railway
+        // actually has instead of an always-empty local map. RAILWAY_* are
+        // Railway's own ("added by Railway") and are never managed here.
+        const variablesByService = new Map<string, Record<string, string>>();
+        await mapWithLimit(domainJobs, 6, async (job) => {
+          if (!job.envId) return;
+          variablesByService.set(
+            job.serviceId,
+            await fetchServiceVariables(token, job.projectId, job.serviceId, job.envId)
+          );
+        });
+
         // Phase 2 — assemble the rows (no more network calls).
         for (const edge of edges) {
           const pNode = edge.node;
@@ -751,12 +837,26 @@ async function startServer() {
               // real and cannot be deleted.
               const domains = isDeleted ? [] : domainsByService.get(sNode.id) || [];
               const deployment = latestDeployments.get(sNode.id);
+              // A null source means the service was created by `railway up`:
+              // there is no repo or image to re-pull, so updating it means
+              // uploading new code.
+              const instanceSource = sNode.serviceInstances?.edges?.[0]?.node?.source;
+              const sourceKind = instanceSource?.repo
+                ? 'repo'
+                : instanceSource?.image
+                  ? 'image'
+                  : 'upload';
               importedServices.push({
                 id: sNode.id,
                 name: sNode.name,
                 icon: sNode.icon || '',
                 templateType: 'custom',
-                imageOrRepo: 'railway-hosted',
+                imageOrRepo: sourceKind === 'repo'
+                  ? instanceSource.repo
+                  : sourceKind === 'image'
+                    ? instanceSource.image
+                    : 'railway-hosted',
+                sourceKind,
                 status: isDeleted ? 'stopped' : mapDeploymentStatus(deployment),
                 latestDeploymentId: deployment?.id || '',
                 deploymentStatus: deployment?.status || '',
@@ -777,7 +877,7 @@ async function startServer() {
                 port: domains.find((d: any) => d.targetPort)?.targetPort || 8080,
                 healthEndpoint: '/health',
                 domains,
-                envVars: {},
+                envVars: isDeleted ? {} : variablesByService.get(sNode.id) || {},
                 createdAt: pNode.updatedAt || new Date().toISOString(),
                 updatedAt: pNode.updatedAt || new Date().toISOString(),
               });
@@ -1802,6 +1902,179 @@ async function startServer() {
     }
   });
 
+  /** Backboard's /up endpoint creates a service implicitly but returns no id;
+   *  the CLI recovers it from the logs URL's `/service/<id>` segment. */
+  function parseServiceIdFromLogsUrl(logsUrl: string): string | null {
+    const afterService = String(logsUrl || '').split('/service/')[1];
+    if (!afterService) return null;
+    const match = afterService.match(/^[A-Za-z0-9-]+/);
+    return match ? match[0] : null;
+  }
+
+  // Local source deploy: the app has no GitHub repo to point Railway at, so it
+  // builds a gzipped tarball in the browser (see src/utils/sourceBundle.ts) and
+  // posts it here, raw, to the same private endpoint `railway up` uses. Express
+  // must not touch the body — it is already a binary archive.
+  app.post(
+    '/api/railway/deploy/source-upload',
+    express.raw({ type: '*/*', limit: '250mb' }),
+    async (req, res) => {
+      try {
+        // The Railway token travels in a header, never the query string, so it
+        // cannot end up in an access log.
+        const token = String(req.headers['x-railway-token'] || '').trim();
+        const projectId = String(req.query.projectId || '').trim();
+        let environmentId = String(req.query.environmentId || '').trim();
+        const serviceId = String(req.query.serviceId || '').trim();
+        const message = String(req.query.message || '').trim();
+        const name = String(req.query.name || '').trim();
+
+        if (!token) return res.status(400).json({ error: 'توکن اکانت ریلوی ارسال نشده است.' });
+        // No projectId is not a client error: an account that has never deployed
+        // has no project yet, and resolveRailwayTargetIds creates one below.
+
+        const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        if (body.length === 0) {
+          return res.status(400).json({ error: 'آرشیو سورس خالی است.' });
+        }
+
+        const targets = await resolveRailwayTargetIds(token, projectId);
+        let realProjId = targets.projectId;
+        let realEnvId = environmentId || targets.environmentId;
+
+        // Same recovery path as the other deploy endpoints: a stale project id
+        // means a replacement project has to be created first.
+        if (projectId && targets.requestedProjectMissing) {
+          const replacement = await createReplacementProject(token, targets.workspaceId);
+          if (!replacement.ok) {
+            return res.status(403).json({ error: replacement.error, code: replacement.code });
+          }
+          realProjId = replacement.projectId;
+          realEnvId = replacement.environmentId;
+        }
+
+        if (!realProjId) {
+          return res.status(400).json({
+            error:
+              'پروژهای روی ریلوی برای این اکانت پیدا نشد. یک پروژه در داشبورد ریلوی بسازید و بعد همگامسازی (Sync) کنید.',
+            code: 'NO_PROJECT',
+          });
+        }
+        if (!realEnvId) {
+          return res.status(400).json({
+            error: 'محیط (environment) برای این پروژه پیدا نشد.',
+            code: 'NO_ENVIRONMENT',
+          });
+        }
+
+        const params = new URLSearchParams({ serviceId });
+        if (message) params.set('message', message);
+        const upUrl = `https://backboard.railway.app/project/${realProjId}/environment/${realEnvId}/up?${params.toString()}`;
+
+        const response = await fetch(upUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/gzip',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: new Uint8Array(body),
+        });
+
+        // UpResponse is camelCase: { deploymentId, url, logsUrl, deploymentDomain }.
+        const rawText = await response.text();
+        let payload: any = null;
+        try {
+          payload = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          payload = null;
+        }
+
+        if (response.status !== 200) {
+          const detail =
+            payload?.message ||
+            (typeof rawText === 'string' && rawText.trim() ? rawText.trim().slice(0, 400) : '');
+          const friendly =
+            response.status === 413
+              ? 'آرشیو سورس برای آپلود خیلی بزرگ است. فایل‌های سنگین (dist، build، node_modules) را حذف کنید.'
+              : detail || `آپلود سورس توسط ریلوی نپذیرفته شد (HTTP ${response.status})`;
+          // Never forward Railway's 401: the browser client treats any 401 on
+          // a non-auth endpoint as ITS OWN session expiring and signs the user
+          // out. An upstream auth failure is reported as a deploy error.
+          const clientStatus = response.status === 401 || response.status === 403 ? 400 : response.status;
+          return res.status(clientStatus).json({
+            error: friendly,
+            httpStatus: response.status,
+            resolvedProjectId: realProjId,
+            resolvedEnvironmentId: realEnvId,
+          });
+        }
+
+        // /up creates the service implicitly, so its id only exists as a
+        // segment of the returned logs URL. When that is unavailable, the
+        // deployment it just queued carries both the id and its status.
+        let discoveredServiceId = parseServiceIdFromLogsUrl(payload?.logsUrl) || serviceId || null;
+        let queuedDeploymentStatus: string | null = null;
+
+        if (payload?.deploymentId) {
+          try {
+            const depRes = await fetch('https://backboard.railway.app/graphql/v2', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                query: 'query Deployment($id: String!) { deployment(id: $id) { id status serviceId } }',
+                variables: { id: payload.deploymentId },
+              }),
+            });
+            const depData = await depRes.json();
+            const node = depData?.data?.deployment;
+            if (node?.status) queuedDeploymentStatus = String(node.status);
+            if (!discoveredServiceId && node?.serviceId) discoveredServiceId = String(node.serviceId);
+          } catch {
+            // Best-effort: the CLI itself survives not knowing the new id.
+          }
+        }
+
+        // /up names the new service itself, so a name typed in the form has
+        // to be applied afterwards. Best-effort: failing to rename must not
+        // fail an upload that already succeeded.
+        let renamed = false;
+        if (discoveredServiceId && name) {
+          try {
+            const renameRes = await fetch('https://backboard.railway.app/graphql/v2', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                query: 'mutation Rename($id: String!, $input: ServiceUpdateInput!) { serviceUpdate(id: $id, input: $input) { id name } }',
+                variables: { id: discoveredServiceId, input: { name } },
+              }),
+            });
+            const renameData = await renameRes.json();
+            renamed = !renameData?.errors?.length && !!renameData?.data?.serviceUpdate?.id;
+          } catch {
+            renamed = false;
+          }
+        }
+
+        return res.json({
+          ...payload,
+          serviceId: discoveredServiceId,
+          deploymentStatus: queuedDeploymentStatus,
+          renamed,
+          resolvedProjectId: realProjId,
+          resolvedEnvironmentId: realEnvId,
+        });
+      } catch (err: any) {
+        return res.status(500).json({ error: err.message || 'Source upload failed' });
+      }
+    }
+  );
+
   // Shared resolver for lifecycle mutations: find the service's newest
   // deployment (restart/redeploy/stop all target a deployment, not a service).
   async function resolveDeploymentTarget(req: any, res: any): Promise<any | null> {
@@ -1944,9 +2217,11 @@ async function startServer() {
       }
       const source = sourceData.data?.serviceInstance?.source || {};
       if (!source.repo && !source.image) {
+        // Uploaded-source services (railway up) have neither. Re-uploading code
+        // is their only update path, which the client handles.
         return res.status(409).json({
           error:
-            'این سرویس از منبع خارجی (ریپو یا ایمیج) تغذیه نمی‌شود؛ منبع آپلوددستی فقط با railway up به‌روز می‌شود.',
+            'این سرویس منبع ریپو یا ایمیج ندارد (با آپلود دستی ساخته شده)؛ برای آپدیت باید سورس جدید آپلود شود.',
           code: 'NO_EXTERNAL_SOURCE',
         });
       }
@@ -2087,7 +2362,7 @@ async function startServer() {
   // 2. Variable Delete Proxy
   app.post('/api/railway/variables/delete', async (req, res) => {
     try {
-      const { token, projectId, environmentId, name } = req.body;
+      const { token, projectId, environmentId, serviceId, name } = req.body;
       if (!token || !name) return res.status(400).json({ error: 'token and name are required' });
 
       const targets = await resolveRailwayTargetIds(token, projectId);
@@ -2100,22 +2375,22 @@ async function startServer() {
         }
       `;
 
+      const input: any = {
+        projectId: realProjId,
+        environmentId: realEnvId,
+        name,
+      };
+      // Without serviceId the delete hits the environment-scoped variable, so a
+      // service-level one would survive and still show after a refresh.
+      if (serviceId) input.serviceId = serviceId;
+
       const response = await fetch('https://backboard.railway.app/graphql/v2', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token.trim()}`,
         },
-        body: JSON.stringify({
-          query,
-          variables: {
-            input: {
-              projectId: realProjId,
-              environmentId: realEnvId,
-              name,
-            },
-          },
-        }),
+        body: JSON.stringify({ query, variables: { input } }),
       });
 
       const data = await response.json();
@@ -2390,6 +2665,7 @@ async function startServer() {
                 id
                 status
                 createdAt
+                serviceId
               }
             }
           }
@@ -2445,6 +2721,42 @@ async function startServer() {
       return res.status(response.status).json(data);
     } catch (err: any) {
       return res.status(500).json({ error: err.message || 'Failed to fetch deployment logs' });
+    }
+  });
+
+  // BUILD logs — a separate stream from deploymentLogs. This is the only place
+  // a failed build says why: a deployment that dies during BUILDING has an
+  // empty deploymentLogs array and a full buildLogs one.
+  app.post('/api/railway/build-logs', async (req, res) => {
+    try {
+      const { token, deploymentId, limit = 300 } = req.body;
+      if (!token || !deploymentId) {
+        return res.status(400).json({ error: 'token and deploymentId are required' });
+      }
+
+      const query = `
+        query GetBuildLogs($deploymentId: String!, $limit: Int) {
+          buildLogs(deploymentId: $deploymentId, limit: $limit) {
+            timestamp
+            message
+            severity
+          }
+        }
+      `;
+
+      const response = await fetch('https://backboard.railway.app/graphql/v2', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token.trim()}`,
+        },
+        body: JSON.stringify({ query, variables: { deploymentId, limit: Number(limit) || 300 } }),
+      });
+
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Failed to fetch build logs' });
     }
   });
 

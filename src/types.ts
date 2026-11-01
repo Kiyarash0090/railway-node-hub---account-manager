@@ -43,6 +43,9 @@ export interface RailwayService {
   icon: string;
   templateType: 'docker' | 'custom';
   imageOrRepo: string;
+  /** Where Railway deploys this service from. 'upload' = built by a manual
+   *  source upload (railway up), which has no repo or image to re-pull. */
+  sourceKind?: 'repo' | 'image' | 'upload';
   status: ServiceStatus;
   cpuUsage: number; // percentage e.g. 14.5
   memoryUsage: number; // MB e.g. 180

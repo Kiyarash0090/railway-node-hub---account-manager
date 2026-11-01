@@ -202,6 +202,72 @@ export async function deployDockerComposeRailway(params: {
   }
 }
 
+/** Response of Railway's private /up endpoint (the one `railway up` uses). */
+export interface SourceUploadResult {
+  deploymentId?: string;
+  url?: string;
+  logsUrl?: string;
+  deploymentDomain?: string;
+  /** Recovered from logsUrl — /up creates the service but does not return its id. */
+  serviceId?: string | null;
+  resolvedProjectId?: string;
+  resolvedEnvironmentId?: string;
+  error?: string;
+  httpStatus?: number;
+}
+
+/**
+ * Uploads a locally built source archive (gzipped tar) so Railway builds and
+ * deploys it with no GitHub repo involved. The archive is forwarded raw to
+ * backboard's /up endpoint — the token goes in a header, not the URL.
+ */
+export async function uploadRailwaySource(params: {
+  token: string;
+  projectId: string;
+  environmentId?: string;
+  serviceId?: string;
+  message?: string;
+  /** Applied after the upload — /up names the service itself. */
+  name?: string;
+  archive: Blob;
+}): Promise<SourceUploadResult> {
+  try {
+    const query = new URLSearchParams({ projectId: params.projectId });
+    if (params.environmentId) query.set('environmentId', params.environmentId);
+    if (params.serviceId) query.set('serviceId', params.serviceId);
+    if (params.message) query.set('message', params.message);
+    if (params.name) query.set('name', params.name);
+
+    const res = await fetch(`/api/railway/deploy/source-upload?${query.toString()}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/gzip',
+        'x-railway-token': params.token.trim(),
+      },
+      body: params.archive,
+    });
+    const raw = await res.text();
+    let data: any = null;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      // A non-JSON body (proxy 502/HTML) must still surface as a real error,
+      // not as a JSON parse message.
+      data = null;
+    }
+    if (!data || typeof data !== 'object') {
+      return {
+        error: `پاسخ نامعتبر از سرور (HTTP ${res.status}). دوباره تلاش کنید.`,
+        httpStatus: res.status,
+      };
+    }
+    data.httpStatus = res.status;
+    return data;
+  } catch (err: any) {
+    return { error: err.message || 'آپلود سورس به ریلوی ناموفق بود' };
+  }
+}
+
 export async function createServiceRailway(params: {
   token: string;
   projectId: string;
@@ -354,6 +420,8 @@ export async function deleteRailwayVariable(params: {
   token: string;
   projectId: string;
   environmentId?: string;
+  /** Scopes the delete to one service instead of the whole environment. */
+  serviceId?: string;
   name: string;
 }) {
   try {
@@ -497,6 +565,25 @@ export async function getRailwayDeployments(params: { token: string; projectId: 
     return await res.json();
   } catch (err: any) {
     return { errors: [{ message: err.message || 'Failed to list deployments' }] };
+  }
+}
+
+/** Build logs — where a failed build explains itself. Runtime `deploymentLogs`
+ *  is empty for a deployment that never got to run. */
+export async function getRailwayBuildLogs(params: {
+  token: string;
+  deploymentId: string;
+  limit?: number;
+}) {
+  try {
+    const res = await fetch('/api/railway/build-logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    return await res.json();
+  } catch (err: any) {
+    return { errors: [{ message: err.message || 'Failed to fetch build logs' }] };
   }
 }
 

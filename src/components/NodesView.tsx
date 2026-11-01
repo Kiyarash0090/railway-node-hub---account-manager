@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import {
   Server,
   Plus,
@@ -24,9 +24,25 @@ import {
   Zap,
   Rocket,
   DownloadCloud,
+  ChevronDown,
 } from 'lucide-react';
-import { useHub, useBackHandler } from '../context/HubContext';
+import {
+  useHub,
+  useBackHandler,
+  type ServiceDeployState,
+  type DeployPhaseStep,
+  deployPhaseFor,
+} from '../context/HubContext';
 import { RailwayService, RailwayProject, RailwayServiceDomain, domainLabel } from '../types';
+import { buildSourceTarball, formatBytes, stripCommonRoot } from '../utils/sourceBundle';
+import {
+  collectIgnorePatterns,
+  extractEnvFromEntries,
+  isRailwayManagedVariable,
+  readSourceSelection,
+  SourceEntry,
+  withoutRailwayVariables,
+} from '../utils/sourceFiles';
 import {
   createRailwayProject,
   upsertRailwayVariable,
@@ -38,7 +54,10 @@ import {
   updateRailwayServiceInstance,
   createRailwayVolume,
   createRailwayEnvironment,
+  uploadRailwaySource,
+  executeRailwayGraphQL,
   getRailwayDeploymentLogs,
+  getRailwayBuildLogs,
   deleteRailwayVolume,
   getRailwayVolumeInstances,
 } from '../services/railwayApi';
@@ -56,6 +75,39 @@ function railTimeAgo(iso?: string): string {
   const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours} ساعت پیش`;
   return `${Math.floor(hours / 24)} روز پیش`;
+}
+
+/** Persian label for each Railway build stage, shown on the service card. */
+const RAILWAY_STAGE_LABELS: Record<string, string> = {
+  QUEUED: 'در صف بیلد',
+  WAITING: 'در انتظار شروع',
+  INITIALIZING: 'آماده‌سازی بیلد',
+  BUILDING: 'در حال بیلد',
+  DEPLOYING: 'در حال انتشار',
+  NEEDS_APPROVAL: 'نیازمند تأیید',
+  REMOVING: 'در حال حذف',
+  SUCCESS: 'منتشر شد',
+  FAILED: 'بیلد شکست خورد',
+  CRASHED: 'اجرا کرش کرد',
+};
+
+/** Build stages in order — drives the progress bar under the status. */
+const LIVE_STAGE_ORDER = ['QUEUED', 'WAITING', 'INITIALIZING', 'BUILDING', 'DEPLOYING'];
+
+/** The four-step list Railway's own deployment panel shows. */
+const DEPLOY_STEPS: { key: DeployPhaseStep; label: string }[] = [
+  { key: 'init', label: 'Initialization' },
+  { key: 'build', label: 'Build > Building the image...' },
+  { key: 'deploy', label: 'Deploy' },
+  { key: 'post', label: 'Post-deploy' },
+];
+
+const STEP_ORDER: DeployPhaseStep[] = ['init', 'build', 'deploy', 'post'];
+
+/** `m:ss`, the duration format Railway uses on this panel. */
+function stepClock(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `(${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')})`;
 }
 
 /** Tailwind text color for a raw Railway deployment status word. */
@@ -141,7 +193,6 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     isSyncingProjects,
     deleteProject,
     deployJob,
-    setDeployJob,
     serviceDeployStates,
     setServiceDeployState,
   } = useHub();
@@ -153,6 +204,46 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
   const [cardActionToast, setCardActionToast] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   // Two-click confirm — delete now removes the service on Railway for real.
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // Build log pulled onto a failed service's card (keyed by service id).
+  const [cardBuildLogs, setCardBuildLogs] = useState<
+    Record<string, { loading?: boolean; text?: string; error?: string }>
+  >({});
+  // Which stream the deploy-logs modal is showing.
+  const [logSource, setLogSource] = useState<'runtime' | 'build'>('runtime');
+
+  // Manual-source update: pick a folder/zip and upload it into an existing
+  // service. After the first `railway up` there is no repo or image to pull
+  // from, so re-uploading the code is the only way to move it forward.
+  const [sourceUpdateService, setSourceUpdateService] = useState<RailwayService | null>(null);
+  const [updateSourceMode, setUpdateSourceMode] = useState<'folder' | 'zip'>('folder');
+  const [updateSourceEntries, setUpdateSourceEntries] = useState<SourceEntry[] | null>(null);
+  const [updateSourceLabel, setUpdateSourceLabel] = useState('');
+  const [updateSourceError, setUpdateSourceError] = useState<string | null>(null);
+  const [isUpdatingSource, setIsUpdatingSource] = useState(false);
+  // Variables read from the picked .env and from the service's current set.
+  const [updateDetectedEnv, setUpdateDetectedEnv] = useState<{
+    vars: Record<string, string>;
+    fileName: string | null;
+  }>({ vars: {}, fileName: null });
+  const [updateVars, setUpdateVars] = useState<Record<string, string>>({});
+  const [envFromFileEnabled, setEnvFromFileEnabled] = useState(true);
+  const updateFolderRef = useRef<HTMLInputElement>(null);
+  const updateZipRef = useRef<HTMLInputElement>(null);
+
+  // Ticks once a second only while some card is actively building, so the
+  // elapsed timer on those cards advances without re-rendering the view.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  const hasRunningDeploy = useMemo(
+    () => Object.values(serviceDeployStates).some((s) => s.status === 'running'),
+    [serviceDeployStates]
+  );
+  useEffect(() => {
+    if (!hasRunningDeploy) return;
+    setNowTick(Date.now());
+    const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [hasRunningDeploy]);
 
   const flashCardToast = (kind: 'ok' | 'error', text: string) => {
     setCardActionToast({ kind, text });
@@ -170,6 +261,139 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     else flashCardToast('error', res.error || 'عملیات روی ریلوی انجام نشد.');
   };
 
+  /** Reads the service's real variables from Railway (the local copy can lag
+   *  behind anything set in the dashboard). Silent on failure: the form then
+   *  keeps whatever it already had. */
+  const loadServiceVariables = async (srv: RailwayService) => {
+    const acc = accountForService(srv);
+    if (!acc?.token) return;
+    try {
+      const res = await executeRailwayGraphQL(
+        acc.token,
+        `query Vars($projectId: String!, $environmentId: String!, $serviceId: String!) {
+           variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId)
+         }`,
+        {
+          projectId: srv.projectId,
+          environmentId: acc.projects.find((p) => p.id === srv.projectId)?.defaultEnvironmentId || '',
+          serviceId: srv.id,
+        }
+      );
+      const vars = res?.data?.variables;
+      if (vars && typeof vars === 'object' && !Array.isArray(vars)) {
+        // Railway's own RAILWAY_* values are dropped: they are shown as
+        // "added by Railway" and must never be sent back.
+        setUpdateVars((prev) => ({
+          ...withoutRailwayVariables(vars as Record<string, string>),
+          ...prev,
+        }));
+      }
+    } catch {
+      // Non-fatal: the form still works with what it has.
+    }
+  };
+
+  /** Loads a picked folder/zip for the manual-source update modal. */
+  const handleUpdateSourceSelection = async (
+    kind: 'directory' | 'zip',
+    files?: FileList | File[],
+    zip?: File
+  ) => {
+    setUpdateSourceError(null);
+    try {
+      const raw = await readSourceSelection({ kind, files, zip });
+      const entries = stripCommonRoot(raw);
+      const total = entries.reduce((sum, e) => sum + (e.data ? e.data.length : 0), 0);
+      if (total === 0) throw new Error('فایل یا پوشه‌ای برای آپلود پیدا نشد.');
+      setUpdateSourceEntries(entries);
+      setUpdateSourceLabel(zip?.name || entries[0]?.path.split('/')[0] || '');
+
+      // Show what the project's .env says before anything is uploaded.
+      const detected = extractEnvFromEntries(entries);
+      setUpdateDetectedEnv(detected);
+      if (detected.fileName) {
+        setEnvFromFileEnabled(true);
+        setUpdateVars((prev) => ({ ...detected.vars, ...prev }));
+      }
+    } catch (err: any) {
+      setUpdateSourceEntries(null);
+      setUpdateSourceLabel('');
+      setUpdateSourceError(err.message || 'خواندن سورس انتخاب‌شده ناموفق بود.');
+    }
+  };
+
+  /**
+   * Uploads code into an EXISTING service. The service came from `railway up`,
+   * so it has no repo/image to pull from — re-uploading is its update path.
+   */
+  const handleUpdateSourceSubmit = async () => {
+    const srv = sourceUpdateService;
+    if (!srv || !updateSourceEntries) return;
+    const acc = accountForService(srv);
+    if (!acc?.token) {
+      setUpdateSourceError('توکن ریلوی برای اکانت این سرویس ثبت نشده است.');
+      return;
+    }
+
+    setIsUpdatingSource(true);
+    setUpdateSourceError(null);
+    const startedAt = Date.now();
+    try {
+      const bundle = await buildSourceTarball(updateSourceEntries, collectIgnorePatterns(updateSourceEntries));
+
+      const upload = await uploadRailwaySource({
+        token: acc.token,
+        projectId: srv.projectId,
+        environmentId: acc.projects.find((p) => p.id === srv.projectId)?.defaultEnvironmentId,
+        serviceId: srv.id,
+        archive: bundle.blob,
+      });
+      if (upload.error) throw new Error(upload.error);
+
+      // Push the variables onto the service before it builds, so the new code
+      // starts with the .env values rather than an empty environment.
+      const envFileKeys = new Set(Object.keys(updateDetectedEnv.vars));
+      const varEntries = Object.entries(updateVars).filter(
+        ([k]) =>
+          k.trim() &&
+          !isRailwayManagedVariable(k) &&
+          (envFromFileEnabled || !envFileKeys.has(k))
+      );
+      if (varEntries.length > 0) {
+        const targetProject = acc.projects.find((p) => p.id === srv.projectId);
+        for (const [name, value] of varEntries) {
+          await upsertRailwayVariable({
+            token: acc.token,
+            projectId: srv.projectId,
+            environmentId: targetProject?.defaultEnvironmentId,
+            serviceId: srv.id,
+            name,
+            value,
+            // The upload above already queued the build; a second one per
+            // variable would restart it repeatedly.
+            skipDeploys: true,
+          });
+        }
+      }
+
+      setServiceDeployState(srv.id, {
+        status: 'running',
+        phase: 'در حال بیلد',
+        startedAt,
+        stageTimestamps: { init: startedAt },
+      });
+
+      setSourceUpdateService(null);
+      setUpdateSourceEntries(null);
+      setUpdateSourceLabel('');
+      flashCardToast('ok', 'سورس آپلود شد؛ بیلد روی ریلوی شروع شد.');
+    } catch (err: any) {
+      setUpdateSourceError(err.message || 'آپلود سورس ناموفق بود.');
+    } finally {
+      setIsUpdatingSource(false);
+    }
+  };
+
   // Modals state
   const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
@@ -178,7 +402,14 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
   const [createProjectError, setCreateProjectError] = useState('');
 
   // 1. Env Vars Modal State
-  const [selectedEnvService, setSelectedEnvService] = useState<RailwayService | null>(null);
+  // Holds only the id: the modal reads the live service so a background sync
+// updating its variables is reflected immediately, instead of the modal
+// freezing on whatever snapshot it happened to open with.
+  const [selectedEnvServiceId, setSelectedEnvService] = useState<string | null>(null);
+  const selectedEnvService = useMemo(
+    () => (selectedEnvServiceId ? allServices.find((s) => s.id === selectedEnvServiceId) ?? null : null),
+    [selectedEnvServiceId, allServices]
+  );
   const [varKeyInput, setVarKeyInput] = useState('');
   const [varValInput, setVarValInput] = useState('');
   const [skipDeploysToggle, setSkipDeploysToggle] = useState(true);
@@ -397,68 +628,105 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
   // Handle Variable Upsert (variableUpsert)
   const handleAddVariable = async () => {
-    if (!selectedEnvService || !varKeyInput.trim() || !targetAccount) return;
-    setIsSavingVar(true);
-
+    if (!selectedEnvService || !varKeyInput.trim()) return;
     const k = varKeyInput.trim();
     const v = varValInput.trim();
 
-    await upsertRailwayVariable({
-      token: targetAccount.token,
-      projectId: selectedEnvService.projectId,
-      serviceId: selectedEnvService.id,
-      name: k,
-      value: v,
-      skipDeploys: skipDeploysToggle,
-    });
+    // Railway manages its own RAILWAY_* variables; writing one back either
+    // fails or duplicates what it already injects.
+    if (isRailwayManagedVariable(k)) {
+      flashCardToast('error', 'متغیرهای RAILWAY_* را خودِ ریلوی مدیریت می‌کند و قابل تنظیم نیستند.');
+      return;
+    }
 
-    // Local update
-    const updatedVars = { ...(selectedEnvService.envVars || {}), [k]: v };
+    const owner = accountForService(selectedEnvService);
+    if (!owner?.token) {
+      flashCardToast('error', 'توکن ریلوی برای اکانت این سرویس ثبت نشده است.');
+      return;
+    }
+
+    setIsSavingVar(true);
+    try {
+      const res = await upsertRailwayVariable({
+        token: owner.token,
+        projectId: selectedEnvService.projectId,
+        // Without environmentId the mutation targets no environment and the
+        // variable silently never lands on the service.
+        environmentId: resolveServiceEnvId(selectedEnvService),
+        serviceId: selectedEnvService.id,
+        name: k,
+        value: v,
+        skipDeploys: skipDeploysToggle,
+      });
+
+      const apiError = extractApiError(res, '');
+      if (apiError) throw new Error(apiError);
+      // variableUpsert returns a boolean; a false means nothing was written.
+      if (res?.data?.variableUpsert === false) {
+        throw new Error('ریلوی ثبت این متغیر را تأیید نکرد.');
+      }
+
+      applyServiceVars(selectedEnvService.id, { ...(selectedEnvService.envVars || {}), [k]: v });
+      addLog({
+        level: 'info',
+        serviceName: selectedEnvService.name,
+        message: `[VAR_UPSERT] Variable ${k} set (skipDeploys: ${skipDeploysToggle}).`,
+      });
+      flashCardToast('ok', `متغیر ${k} ثبت شد.`);
+      setVarKeyInput('');
+      setVarValInput('');
+    } catch (err: any) {
+      flashCardToast('error', err?.message || 'ثبت متغیر روی ریلوی ناموفق بود.');
+    } finally {
+      setIsSavingVar(false);
+    }
+  };
+
+  /** Writes a variables map onto one service in local hub state. */
+  const applyServiceVars = (serviceId: string, vars: Record<string, string>) => {
     accounts.forEach((acc) => {
       const updatedProjects = acc.projects.map((p) => ({
         ...p,
-        services: p.services.map((s) => (s.id === selectedEnvService.id ? { ...s, envVars: updatedVars } : s)),
+        services: p.services.map((s) => (s.id === serviceId ? { ...s, envVars: vars } : s)),
       }));
       updateAccount(acc.id, { projects: updatedProjects });
     });
-
-    addLog({
-      level: 'info',
-      serviceName: selectedEnvService.name,
-      message: `[VAR_UPSERT] Variable ${k} set (skipDeploys: ${skipDeploysToggle}).`,
-    });
-
-    setVarKeyInput('');
-    setVarValInput('');
-    setIsSavingVar(false);
-  };
+    }
 
   // Handle Variable Delete (variableDelete)
   const handleDeleteVariable = async (keyToDelete: string) => {
-    if (!selectedEnvService || !targetAccount) return;
+    if (!selectedEnvService) return;
+    const owner = accountForService(selectedEnvService);
+    if (!owner?.token) {
+      flashCardToast('error', 'توکن ریلوی برای اکانت این سرویس ثبت نشده است.');
+      return;
+    }
 
-    await deleteRailwayVariable({
-      token: targetAccount.token,
-      projectId: selectedEnvService.projectId,
-      name: keyToDelete,
-    });
+    try {
+      const res = await deleteRailwayVariable({
+        token: owner.token,
+        projectId: selectedEnvService.projectId,
+        environmentId: resolveServiceEnvId(selectedEnvService),
+        serviceId: selectedEnvService.id,
+        name: keyToDelete,
+      });
 
-    const updatedVars = { ...(selectedEnvService.envVars || {}) };
-    delete updatedVars[keyToDelete];
+      const apiError = extractApiError(res, '');
+      if (apiError) throw new Error(apiError);
 
-    accounts.forEach((acc) => {
-      const updatedProjects = acc.projects.map((p) => ({
-        ...p,
-        services: p.services.map((s) => (s.id === selectedEnvService.id ? { ...s, envVars: updatedVars } : s)),
-      }));
-      updateAccount(acc.id, { projects: updatedProjects });
-    });
+      const updatedVars = { ...(selectedEnvService.envVars || {}) };
+      delete updatedVars[keyToDelete];
+      applyServiceVars(selectedEnvService.id, updatedVars);
 
-    addLog({
-      level: 'warn',
-      serviceName: selectedEnvService.name,
-      message: `[VAR_DELETE] Variable ${keyToDelete} removed.`,
-    });
+      addLog({
+        level: 'warn',
+        serviceName: selectedEnvService.name,
+        message: `[VAR_DELETE] Variable ${keyToDelete} removed.`,
+      });
+      flashCardToast('ok', `متغیر ${keyToDelete} حذف شد.`);
+    } catch (err: any) {
+      flashCardToast('error', err?.message || 'حذف متغیر از ریلوی ناموفق بود.');
+    }
   };
 
   /** Resolves the environment UUID for a service's project (needed by domain APIs). */
@@ -502,7 +770,31 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
       const err = extractApiError(res, '');
       if (err) throw new Error(err);
       const list = res?.data?.deploymentLogs;
-      setDeployLogs(Array.isArray(list) ? list : []);
+
+      if (Array.isArray(list) && list.length > 0) {
+        setLogSource('runtime');
+        setDeployLogs(list);
+        return;
+      }
+
+      // A deployment that failed during the build never ran, so its runtime
+      // log is empty — the reason only exists in buildLogs.
+      const buildRes = await getRailwayBuildLogs({
+        token: acc.token,
+        deploymentId: service.latestDeploymentId,
+        limit: 400,
+      });
+      const buildErr = extractApiError(buildRes, '');
+      if (buildErr) throw new Error(buildErr);
+      const buildList = buildRes?.data?.buildLogs;
+
+      if (Array.isArray(buildList) && buildList.length > 0) {
+        setLogSource('build');
+        setDeployLogs(buildList);
+      } else {
+        setLogSource('runtime');
+        setDeployLogs([]);
+      }
     } catch (e: any) {
       setDeployLogs([]);
       setLogsError(e.message || 'دریافت لاگ از ریلوی ناموفق بود.');
@@ -516,6 +808,68 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     setDeployLogs([]);
     setLogsError(null);
     await loadDeployLogs(service);
+  };
+
+  /** Fetches the build log of a failed deployment onto the service's card, so
+   *  it is readable without opening the logs modal.
+   *
+   *  Deliberately NOT a useCallback: memoizing it on `cardBuildLogs` pinned the
+   *  closure to the first render, where `accounts` is still empty — the early
+   *  return then meant the state never changed, so the stale closure was never
+   *  replaced and the button did nothing forever. */
+  const loadCardBuildLogs = async (service: RailwayService) => {
+      const acc = accountForService(service);
+      if (!acc?.token || !service.latestDeploymentId) {
+        setCardBuildLogs((prev) => ({
+          ...prev,
+          [service.id]: {
+            loading: false,
+            text: prev[service.id]?.text,
+            error: !acc?.token
+              ? 'توکن ریلوی برای اکانت این سرویس در دسترس نیست.'
+              : 'این سرویس هنوز استقراری روی ریلوی ندارد.',
+          },
+        }));
+        return;
+      }
+      if (cardBuildLogs[service.id]?.loading) return;
+
+      setCardBuildLogs((prev) => ({ ...prev, [service.id]: { loading: true, text: prev[service.id]?.text } }));
+      try {
+        const res = await getRailwayBuildLogs({
+          token: acc.token,
+          deploymentId: service.latestDeploymentId,
+          limit: 300,
+        });
+
+        const apiError = extractApiError(res, '');
+        const rows = res?.data?.buildLogs;
+        const text = Array.isArray(rows)
+          ? rows
+              .slice(-80)
+              .map((l: any) => (typeof l?.message === 'string' ? l.message.replace(/\r/g, '') : ''))
+              .filter(Boolean)
+              .join('')
+              .slice(-6000)
+          : '';
+
+        // An empty result is a real answer, not a reason to show nothing: the
+        // card says why instead of silently doing nothing when clicked.
+        const error = apiError
+          ? apiError
+          : !Array.isArray(rows)
+            ? 'ریلوی لاگی برای این استقرار برنگرداند.'
+            : text
+              ? undefined
+              : 'لاگ بیلدی برای این استقرار ثبت نشده است.';
+
+        setCardBuildLogs((prev) => ({ ...prev, [service.id]: { loading: false, text, error } }));
+      } catch (e: any) {
+        setCardBuildLogs((prev) => ({
+          ...prev,
+          [service.id]: { loading: false, text: '', error: e?.message || 'دریافت لاگ ناموفق بود.' },
+        }));
+      }
   };
 
   // Keep the newest log line in view once a fetch lands.
@@ -1028,6 +1382,14 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
           {filteredServices.map((srv) => {
             const parentAccount = accounts.find((a) => a.id === srv.accountId);
             const isHealthy = srv.status === 'healthy';
+            // Uploaded source (railway up) — no repo/image exists to re-pull.
+            // Generated placeholder from the source-upload flow; an untyped service
+// without it is treated as railway-opaque and also re-uploaded.
+            const isManualSource =
+              srv.sourceKind
+                ? srv.sourceKind === 'upload'
+                : (srv.imageOrRepo || '').startsWith('source-upload') ||
+                  srv.imageOrRepo === 'railway-hosted';
             const isStopped = srv.status === 'stopped';
             const isCrashed = srv.status === 'crashed';
             const isDeploying = srv.status === 'deploying';
@@ -1090,50 +1452,255 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                     {srv.deploymentStatusAt && <span>· {railTimeAgo(srv.deploymentStatusAt)}</span>}
                   </div>
 
-                  {/* Live deploy-job strip for THIS service (independent of header banner, survives refresh/tab switch) */}
+                  {/* Live deploy state for THIS service — part of the card, not
+                      a dismissible notice: it reflects the build on Railway. */}
                   {(() => {
                     const cardState = serviceDeployStates[srv.id] || (deployJob?.serviceId === srv.id ? deployJob : null);
-                    if (!cardState) return null;
+
+                    // A service whose latest deployment failed shows it even
+                    // when this session never started that deploy (it was
+                    // uploaded from elsewhere, or the tab was closed).
+                    const railStatus = (srv.deploymentStatus || '').toUpperCase();
+                    const failedOnRailway = railStatus === 'FAILED' || railStatus === 'CRASHED';
+                    const buildingOnRailway = deployPhaseFor(railStatus) !== null && railStatus !== 'SUCCESS';
+                    const synthesized = !cardState && (failedOnRailway || buildingOnRailway);
+
+                    if (!cardState && !synthesized) return null;
+
+                    const effective = cardState ?? {
+                      status: (buildingOnRailway ? 'running' : 'error') as 'running' | 'error',
+                      phase: buildingOnRailway
+                        ? RAILWAY_STAGE_LABELS[railStatus] || railStatus
+                        : `دیپلوی روی ریلوی شکست خورد (${railStatus})`,
+                      railwayStatus: railStatus,
+                      startedAt: srv.deploymentStatusAt ? new Date(srv.deploymentStatusAt).getTime() : undefined,
+                    };
+
+                    const isRunning = effective.status === 'running';
+                    const isSuccess = effective.status === 'success';
+                    const liveStatus = (effective as ServiceDeployState).railwayStatus;
+                    const startedAt = (effective as ServiceDeployState).startedAt;
+
+                    // Elapsed time ticks every second while the build runs.
+                    const elapsed = startedAt ? Math.max(0, Math.floor((nowTick - startedAt) / 1000)) : 0;
+                    const elapsedLabel = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}`;
+
+                    const stage = liveStatus
+                      ? RAILWAY_STAGE_LABELS[liveStatus] || liveStatus
+                      : effective.phase;
+                    // Until Railway reports a stage, the flow's own phase text
+                    // is the only information — show it instead of a bare bar.
+                    const stageIndex = liveStatus ? LIVE_STAGE_ORDER.indexOf(liveStatus) : -1;
+
                     return (
                       <div
-                        className={`mb-2.5 flex items-center gap-2 rounded-xl border px-2.5 py-1.5 text-xs font-medium ${
-                          cardState.status === 'running'
-                            ? 'bg-sky-500/10 border-sky-500/30 text-sky-300'
-                            : cardState.status === 'success'
-                              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
-                              : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                        className={`mb-2.5 rounded-xl border px-2.5 py-1.5 ${
+                          isRunning
+                            ? 'bg-sky-500/10 border-sky-500/30'
+                            : isSuccess
+                              ? 'bg-emerald-500/10 border-emerald-500/30'
+                              : 'bg-rose-500/10 border-rose-500/30'
                         }`}
                       >
-                        {cardState.status === 'running' ? (
-                          <RotateCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
-                        ) : cardState.status === 'success' ? (
-                          <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
-                        ) : (
-                          <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
-                        )}
-                        <span className="truncate flex-1 font-mono text-[11px]" title={cardState.phase}>
-                          {cardState.phase}
-                        </span>
-                        {cardState.domain && (
-                          <a
-                            href={`https://${cardState.domain}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-mono text-[9px] bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 rounded-lg text-emerald-200 shrink-0 hover:bg-emerald-500/30 transition"
+                        <div className="flex items-center gap-2 text-[11px] font-medium">
+                          {isRunning ? (
+                            <RotateCw className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-300" />
+                          ) : isSuccess ? (
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                          ) : (
+                            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+                          )}
+                          <span
+                            className={`truncate flex-1 font-mono ${
+                              isRunning ? 'text-sky-200' : isSuccess ? 'text-emerald-200' : 'text-rose-200'
+                            }`}
+                            title={effective.phase}
                           >
-                            دامنه
-                          </a>
-                        )}
-                        <button
-                          onClick={() => {
-                            setServiceDeployState(srv.id, null);
-                            if (deployJob?.serviceId === srv.id) setDeployJob(null);
-                          }}
-                          title="بستن اعلان دیپلوی"
-                          className="shrink-0 rounded-md p-0.5 text-current opacity-50 hover:opacity-100 transition"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                        </button>
+                            {stage}
+                          </span>
+                          {isRunning && startedAt && (
+                            <span className="shrink-0 font-mono text-[10px] tabular-nums opacity-70" dir="ltr">
+                              {elapsedLabel}
+                            </span>
+                          )}
+                          {(effective as ServiceDeployState).domain && (
+                            <a
+                              href={`https://${(effective as ServiceDeployState).domain}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="font-mono text-[9px] bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 rounded-lg text-emerald-200 shrink-0 hover:bg-emerald-500/30 transition"
+                            >
+                              دامنه
+                            </a>
+                          )}
+                        </div>
+                        {/* Four-stage list, mirroring Railway's deployment panel. */}
+                        {(() => {
+                          const currentPhase = deployPhaseFor(liveStatus);
+                          const stamps = (effective as ServiceDeployState).stageTimestamps || {};
+                          const finishedAt = (effective as ServiceDeployState).finishedAt;
+                          const isFailed = !isRunning && !isSuccess;
+                          const attempt = (effective as ServiceDeployState).attempt;
+
+                          // FAILED/CRASHED name no stage. The furthest stage the
+                          // build is known to have reached comes from the stamps
+                          // collected while it ran, so the list still shows where
+                          // it stopped instead of "Not started" everywhere.
+                          // The synced deployment time is the honest anchor when this session never
+// saw the build: Railway reports when the deployment last changed state,
+// which is the stage that just finished.
+                          const syncedAt = srv.deploymentStatusAt
+                            ? new Date(srv.deploymentStatusAt).getTime()
+                            : undefined;
+
+                          // A build that failed on Railway must have got past
+                          // initialization and into the build itself. Without
+                          // this, a failure witnessed only by sync shows every
+                          // stage as "Not started".
+                          const fallbackStamps: Partial<Record<DeployPhaseStep, number>> =
+                            isFailed && syncedAt && !stamps.init
+                              ? { init: syncedAt, build: syncedAt }
+                              : {};
+
+                          const effectiveStamps = Object.keys(stamps).length > 0 ? stamps : fallbackStamps;
+
+                          const furthestStamp = STEP_ORDER.reduce(
+                            (max, key, i) => (effectiveStamps[key] ? i : max),
+                            -1
+                          );
+                          const currentIdx = currentPhase
+                            ? STEP_ORDER.indexOf(currentPhase)
+                            : isFailed
+                              ? furthestStamp
+                              : -1;
+
+                          // Timestamps come from local observation, which only
+                          // starts when this session noticed the build. If the
+                          // first stamp is missing there is nothing honest to
+                          // show, so durations are omitted rather than guessed.
+                          const canShowTimes = !!stamps.init;
+
+                          return (
+                            <div className="mt-2 space-y-1">
+                              {attempt && attempt > 1 && (
+                                <div className="text-[10px] font-mono text-neutral-500" dir="ltr">
+                                  Attempt #{attempt}
+                                </div>
+                              )}
+                              {DEPLOY_STEPS.map((step, i) => {
+                                const reached = currentIdx >= 0 && i <= currentIdx;
+                                const isCurrent = i === currentIdx && isRunning;
+                                const startedAtStep = effectiveStamps[step.key];
+                                const nextStepStart = STEP_ORDER[i + 1]
+                                  ? effectiveStamps[STEP_ORDER[i + 1]]
+                                  : undefined;
+                                const stepEnd = nextStepStart ?? (isCurrent ? nowTick : finishedAt);
+                                const duration =
+                                  canShowTimes && startedAtStep && stepEnd
+                                    ? stepClock(stepEnd - startedAtStep)
+                                    : '';
+
+                                // Railway itself reports no per-stage time; when
+                                // this session did not witness the stage, say so
+                                // rather than inventing a duration.
+                                const unknownTime = reached && !duration;
+
+                                // A failed build stops at the stage it died in;
+                                // the rest never ran.
+                                const failedHere = isFailed && i === currentIdx;
+                                const notStarted = currentIdx < 0 ? i > 0 : i > currentIdx;
+
+                                return (
+                                  <div
+                                    key={step.key}
+                                    className={`flex items-center gap-2 text-[10px] font-mono ${
+                                      reached
+                                        ? failedHere
+                                          ? 'text-rose-300'
+                                          : 'text-neutral-200'
+                                        : 'text-neutral-500'
+                                    }`}
+                                  >
+                                    <span className="w-3 shrink-0 flex items-center justify-center">
+                                      {isCurrent ? (
+                                        <RotateCw className="h-2.5 w-2.5 animate-spin text-sky-400" />
+                                      ) : reached && !failedHere ? (
+                                        <Check className="h-2.5 w-2.5 text-emerald-400" />
+                                      ) : failedHere ? (
+                                        <AlertTriangle className="h-2.5 w-2.5 text-rose-400" />
+                                      ) : (
+                                        <span className="h-2 w-2 rounded-full border border-neutral-600" />
+                                      )}
+                                    </span>
+                                    <span className="truncate flex-1" dir="ltr">
+                                      {step.label}
+                                    </span>
+                                    <span
+                                      className={`shrink-0 tabular-nums ${reached ? 'opacity-70' : 'opacity-40'}`}
+                                      dir="ltr"
+                                    >
+                                      {duration ||
+                                        (unknownTime
+                                          ? '—'
+                                          : notStarted || (!reached && !isCurrent)
+                                            ? 'Not started'
+                                            : '')}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          );
+                        })()}
+
+                        {/* The build's own log, kept on the card after the run
+                            fails — the banner would be gone by now. A failure
+                            this session did not start has no stored log, so it
+                            is fetched the first time the details are opened. */}
+                        {(() => {
+                          const stored = (effective as ServiceDeployState).buildLogs;
+                          const fetched = cardBuildLogs[srv.id];
+                          const logs = stored || fetched?.text;
+                          if (!isRunning && !logs) {
+                            return (
+                              <div className="mt-2">
+                                <button
+                                  type="button"
+                                  onClick={() => loadCardBuildLogs(srv)}
+                                  disabled={fetched?.loading}
+                                  className="flex items-center gap-1 text-[10px] font-semibold text-rose-300/80 hover:text-rose-200 disabled:opacity-60"
+                                >
+                                  {fetched?.loading ? (
+                                    <RotateCw className="h-3 w-3 animate-spin" />
+                                  ) : (
+                                    <DownloadCloud className="h-3 w-3" />
+                                  )}
+                                  <span>
+                                    {fetched?.loading ? 'در حال دریافت لاگ...' : 'نمایش لاگ بیلد (دلیل شکست)'}
+                                  </span>
+                                </button>
+                                {fetched?.error && !fetched.loading && (
+                                  <p className="mt-1 text-[10px] leading-relaxed text-neutral-400">{fetched.error}</p>
+                                )}
+                              </div>
+                            );
+                          }
+                          if (!logs) return null;
+                          return (
+                            <details className="mt-2 group" open={!stored && !!fetched?.text}>
+                              <summary className="cursor-pointer list-none text-[10px] font-semibold text-rose-300/80 hover:text-rose-200 flex items-center gap-1">
+                                <ChevronDown className="h-3 w-3 transition-transform group-open:rotate-180" />
+                                <span>لاگ بیلد (دلیل شکست)</span>
+                              </summary>
+                              <pre
+                                dir="ltr"
+                                className="mt-1.5 max-h-56 overflow-auto rounded-lg bg-black/60 border border-rose-500/20 p-2 text-[10px] leading-relaxed text-neutral-300 font-mono whitespace-pre-wrap break-words"
+                              >
+                                {logs}
+                              </pre>
+                            </details>
+                          );
+                        })()}
                       </div>
                     );
                   })()}
@@ -1200,7 +1767,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                 <div className="pt-2.5 border-t border-neutral-800 flex items-center justify-between gap-1 flex-wrap">
                   <div className="flex items-center gap-1">
                     <button
-                      onClick={() => setSelectedEnvService(srv)}
+                      onClick={() => setSelectedEnvService(srv.id)}
                       className="rounded-lg border border-neutral-800 bg-neutral-950 p-1.5 text-neutral-400 hover:text-white hover:border-neutral-700 transition"
                       title="مدیریت متغیرهای محیطی (variableUpsert)"
                     >
@@ -1256,11 +1823,30 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                       <Rocket className="h-3.5 w-3.5" />
                     </button>
                     <button
-                      onClick={() =>
-                        runCardAction(srv, updateSourceService, 'آپدیت از آخرین سورس در ریلوی صف شد.')
-                      }
+                      onClick={() => {
+                        // A manual-source service has nothing to pull, so its
+                        // update is a fresh upload; repo/image ones keep the
+                        // re-resolve behaviour.
+                        if (isManualSource) {
+                          setSourceUpdateService(srv);
+                          setUpdateSourceEntries(null);
+                          setUpdateSourceLabel('');
+                          setUpdateSourceError(null);
+                          setUpdateDetectedEnv({ vars: {}, fileName: null });
+                          // Start from the variables the service already has,
+                          // then let the picked .env fill in or override.
+                          setUpdateVars({ ...(srv.envVars || {}) });
+                          void loadServiceVariables(srv);
+                        } else {
+                          void runCardAction(srv, updateSourceService, 'آپدیت از آخرین سورس در ریلوی صف شد.');
+                        }
+                      }}
                       className="rounded-lg border border-neutral-800 bg-neutral-950 p-1.5 text-neutral-400 hover:text-emerald-400 hover:border-emerald-500/30 transition"
-                      title="آپدیت دستی از آخرین سورس (ایمیج: serviceInstanceRedeploy · ریپو: serviceInstanceDeploy + latestCommit)"
+                      title={
+                        isManualSource
+                          ? 'آپدیت سرویس با آپلود سورس جدید (این سرویس ریپو/ایمیج ندارد)'
+                          : 'آپدیت دستی از آخرین سورس (ایمیج: serviceInstanceRedeploy · ریپو: serviceInstanceDeploy + latestCommit)'
+                      }
                     >
                       <DownloadCloud className="h-3.5 w-3.5" />
                     </button>
@@ -1724,6 +2310,180 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
         </div>
       )}
 
+      {/* 4b. Manual source update — upload new code into an existing service */}
+      {sourceUpdateService && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+          <div className="w-[96vw] max-w-lg rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-5 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between gap-2 border-b border-neutral-800 pb-3 mb-3">
+              <div className="flex items-center gap-2 min-w-0">
+                <DownloadCloud className="h-5 w-5 text-emerald-400 shrink-0" />
+                <div className="min-w-0">
+                  <h3 className="text-sm font-bold text-white truncate">آپدیت سورس {sourceUpdateService.name}</h3>
+                  <p className="text-[10px] text-neutral-500">
+                    این سرویس با آپلود دستی ساخته شده؛ برای به‌روزرسانی، سورس جدید را انتخاب کنید.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setSourceUpdateService(null)}
+                className="rounded-lg border border-neutral-800 p-1.5 text-neutral-400 hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-1.5 rounded-xl bg-neutral-950 p-1 border border-neutral-800">
+                <button
+                  type="button"
+                  onClick={() => setUpdateSourceMode('folder')}
+                  className={`flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-[11px] font-medium transition ${
+                    updateSourceMode === 'folder' ? 'bg-emerald-600 text-white font-bold' : 'text-neutral-400 hover:text-neutral-200'
+                  }`}
+                >
+                  <FolderGit2 className="h-3.5 w-3.5" />
+                  <span>انتخاب پوشه</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setUpdateSourceMode('zip')}
+                  className={`flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-[11px] font-medium transition ${
+                    updateSourceMode === 'zip' ? 'bg-emerald-600 text-white font-bold' : 'text-neutral-400 hover:text-neutral-200'
+                  }`}
+                >
+                  <Terminal className="h-3.5 w-3.5" />
+                  <span>فایل zip</span>
+                </button>
+              </div>
+
+              <input
+                ref={updateFolderRef}
+                type="file"
+                className="hidden"
+                /* @ts-expect-error webkitdirectory is non-standard but supported */
+                webkitdirectory=""
+                directory=""
+                multiple
+                onChange={(e) => {
+                  const files = e.target.files;
+                  if (files && files.length > 0) handleUpdateSourceSelection('directory', files);
+                  e.target.value = '';
+                }}
+              />
+              <input
+                ref={updateZipRef}
+                type="file"
+                className="hidden"
+                accept=".zip,application/zip"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleUpdateSourceSelection('zip', undefined, file);
+                  e.target.value = '';
+                }}
+              />
+
+              <button
+                type="button"
+                onClick={() =>
+                  updateSourceMode === 'folder' ? updateFolderRef.current?.click() : updateZipRef.current?.click()
+                }
+                className="w-full flex items-center justify-center gap-2 rounded-xl border border-dashed border-neutral-700 bg-neutral-950/70 px-3 py-4 text-xs text-neutral-300 hover:border-emerald-500/60 hover:text-white transition"
+              >
+                {updateSourceEntries ? (
+                  <>
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+                    <span className="truncate" dir="ltr">
+                      {updateSourceLabel || 'سورس انتخاب شد'}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <DownloadCloud className="h-4 w-4 text-emerald-400" />
+                    <span>{updateSourceMode === 'folder' ? 'انتخاب پوشه پروژه' : 'انتخاب فایل zip'}</span>
+                  </>
+                )}
+              </button>
+
+              {updateSourceEntries && (
+                <div className="text-[10px] text-neutral-500 text-center">
+                  {updateSourceEntries.filter((e) => !e.directory).length.toLocaleString('fa-IR')} فایل ·{' '}
+                  {formatBytes(updateSourceEntries.reduce((s, e) => s + (e.data ? e.data.length : 0), 0))}
+                </div>
+              )}
+
+              {Object.keys(updateVars).length > 0 && (
+                <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-2.5 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-bold text-emerald-300">
+                      {Object.keys(updateVars).length.toLocaleString('fa-IR')} متغیر محیطی
+                      {updateDetectedEnv.fileName && (
+                        <>
+                          {' '}
+                          (از{' '}
+                          <span className="font-mono" dir="ltr">
+                            {updateDetectedEnv.fileName}
+                          </span>
+                          )
+                        </>
+                      )}
+                    </span>
+                    {updateDetectedEnv.fileName && (
+                      <button
+                        type="button"
+                        onClick={() => setEnvFromFileEnabled((v) => !v)}
+                        className={`rounded-md px-2 py-0.5 text-[10px] font-semibold border transition ${
+                          envFromFileEnabled
+                            ? 'border-emerald-500/40 bg-emerald-500/20 text-emerald-200'
+                            : 'border-neutral-700 bg-neutral-800 text-neutral-400'
+                        }`}
+                      >
+                        {envFromFileEnabled ? 'اعمال می‌شود' : 'اعمال نشود'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-1 max-h-24 overflow-y-auto">
+                    {Object.entries(updateVars).map(([key, value]) => (
+                      <span
+                        key={key}
+                        title={`${key}=${value}`}
+                        className="rounded-md bg-neutral-900 border border-neutral-800 px-1.5 py-0.5 font-mono text-[9px] text-emerald-300"
+                        dir="ltr"
+                      >
+                        {key}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {updateSourceError && (
+                <div className="flex items-start gap-2 rounded-xl bg-rose-500/10 border border-rose-500/30 p-2.5 text-[11px] text-rose-300">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                  <span className="whitespace-pre-wrap break-words leading-relaxed">{updateSourceError}</span>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-neutral-800">
+                <button
+                  onClick={() => setSourceUpdateService(null)}
+                  className="rounded-xl border border-neutral-800 px-3.5 py-1.5 text-neutral-400 hover:text-white"
+                >
+                  انصراف
+                </button>
+                <button
+                  onClick={handleUpdateSourceSubmit}
+                  disabled={isUpdatingSource || !updateSourceEntries}
+                  className="rounded-xl bg-emerald-600 px-4 py-1.5 font-bold text-white hover:bg-emerald-500 transition disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  {isUpdatingSource && <RotateCw className="h-3.5 w-3.5 animate-spin" />}
+                  آپلود و دیپلوی مجدد
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 5. Deploy Logs Modal (deploymentLogs) */}
       {selectedLogService && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
@@ -1733,7 +2493,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
                 <Terminal className="h-5 w-5 text-emerald-400 shrink-0" />
                 <div className="min-w-0">
                   <h3 className="text-sm font-bold text-white truncate">
-                    لاگ‌های دیپلوی {selectedLogService.name}
+                    لاگ‌های {logSource === 'build' ? 'بیلد' : 'اجرای'} دیپلوی {selectedLogService.name}
                   </h3>
                   <p className="text-[10px] text-neutral-500 font-mono truncate" dir="ltr">
                     {selectedLogService.latestDeploymentId || 'no deployment'}

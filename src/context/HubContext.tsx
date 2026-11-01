@@ -10,7 +10,7 @@ import {
   ServiceStatus,
 } from '../types';
 import { INITIAL_ACCOUNTS, INITIAL_LOGS } from '../constants/initialData';
-import { validateRailwayToken, syncRailwayProjects, deleteRailwayProject, restartRailwayService, redeployRailwayService, manualUpdateRailwayService, stopRailwayService, deleteRailwayService, getRailwayServiceMetrics } from '../services/railwayApi';
+import { validateRailwayToken, syncRailwayProjects, deleteRailwayProject, restartRailwayService, redeployRailwayService, manualUpdateRailwayService, stopRailwayService, deleteRailwayService, getRailwayServiceMetrics, getRailwayDeployments, getRailwayBuildLogs } from '../services/railwayApi';
 import { extractApiError } from '../utils/githubRepo';
 import { apiFetch as fetch } from '../services/authApi';
 
@@ -31,13 +31,82 @@ export interface ServiceDeployState {
   phase: string;
   domain?: string;
   updatedAt?: number;
+  /** Real Railway deployment status right now (BUILDING / DEPLOYING / ...),
+   *  refreshed on the card while the build is live. */
+  railwayStatus?: string;
+  /** When this build started — lets the card show elapsed time. */
+  startedAt?: number;
+  /** Railway deployment the logs belong to. */
+  deploymentId?: string;
+  /** Build log text, filled when the build fails so the reason survives the
+   *  header banner expiring. */
+  buildLogs?: string;
+  /** When each stage was first seen, so the card can show per-stage durations
+   *  the way Railway's deployment panel does. */
+  stageTimestamps?: Partial<Record<DeployPhaseStep, number>>;
+  /** Epoch ms when Railway reported the terminal state. */
+  finishedAt?: number;
+  /** 1-based attempt number when Railway retries the same deployment. */
+  attempt?: number;
 }
+
+/** Persian label for each Railway build stage (mirrors NodesView's copy). */
+const RAILWAY_STAGE_LABELS: Record<string, string> = {
+  QUEUED: 'در صف بیلد',
+  WAITING: 'در انتظار شروع',
+  INITIALIZING: 'آماده‌سازی بیلد',
+  BUILDING: 'در حال بیلد',
+  DEPLOYING: 'در حال انتشار',
+  NEEDS_APPROVAL: 'نیازمند تأیید',
+  REMOVING: 'در حال حذف',
+  SUCCESS: 'منتشر شد',
+  FAILED: 'بیلد شکست خورد',
+  CRASHED: 'اجرا کرش کرد',
+};
+
+/** The four stages Railway's own deployment panel shows, in order. The phase
+ *  is derived from the raw status, which is the only stage signal the API
+ *  gives us between INITIALIZING and a finished build. */
+export type DeployPhaseStep = 'init' | 'build' | 'deploy' | 'post';
+
+export function deployPhaseFor(status?: string): DeployPhaseStep | null {
+  switch ((status || '').toUpperCase()) {
+    case 'QUEUED':
+    case 'WAITING':
+    case 'INITIALIZING':
+    case 'NEEDS_APPROVAL':
+      return 'init';
+    case 'BUILDING':
+      return 'build';
+    case 'DEPLOYING':
+      return 'deploy';
+    case 'SUCCESS':
+      return 'post';
+    default:
+      return null;
+  }
+}
+
+/** Railway statuses that mean "a build/deploy is still in progress". */
+const LIVE_DEPLOY_STATUSES = new Set([
+  'QUEUED',
+  'WAITING',
+  'INITIALIZING',
+  'BUILDING',
+  'DEPLOYING',
+  'NEEDS_APPROVAL',
+  'REMOVING',
+]);
 
 /** True once Railway's deployment for this service has reached a final state —
  *  any "still building" marker for it is stale by definition. */
 function isDeploymentSettled(srv: RailwayService): boolean {
-  if (srv.deploymentStopped) return true;
   const status = (srv.deploymentStatus || '').toUpperCase();
+  // A build that is running outranks the old deployment's stopped flag: after
+  // a failure the previous deployment stays stopped while the retry builds,
+  // and treating that as settled deleted the live state on every poll.
+  if (LIVE_DEPLOY_STATUSES.has(status)) return false;
+  if (srv.deploymentStopped) return true;
   return status === 'SUCCESS' || status === 'FAILED' || status === 'CRASHED' || status === 'REMOVED';
 }
 
@@ -154,6 +223,9 @@ const ACTIVE_TAB_STORAGE_KEY = 'railway_hub_active_tab_v1';
 const DELETED_VOLUME_STORAGE_KEY = 'railway_hub_deleted_volumes_v1';
 /** How long a FINISHED deploy banner/strip stays on screen before it goes. */
 const DEPLOY_DONE_TTL_MS = 10_000;
+/** The card's live status must outlive a successful build by a beat, or the
+ *  final "deployed" state would vanish the moment it is set. */
+const SERVICE_DEPLOY_DONE_TTL_MS = 60_000;
 /** A "running" job nobody can finish any more (tab closed mid-build) expires. */
 const DEPLOY_JOB_MAX_RUNNING_MS = 30 * 60_000;
 const SERVICE_DEPLOY_MAX_RUNNING_MS = 60 * 60_000;
@@ -330,7 +402,9 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!state) {
         delete next[serviceId];
       } else {
-        next[serviceId] = { ...state, updatedAt: Date.now() };
+        // A caller that anchors the build's start (the live poller) keeps its
+        // timestamp; everything else is stamped now.
+        next[serviceId] = { ...state, updatedAt: state.updatedAt ?? Date.now() };
       }
       try {
         localStorage.setItem(SERVICE_DEPLOY_STATES_STORAGE_KEY, JSON.stringify(next));
@@ -362,7 +436,7 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const age = now - (st.updatedAt || 0);
       const delay =
         st.status !== 'running'
-          ? Math.max(0, DEPLOY_DONE_TTL_MS - age)
+          ? Math.max(0, SERVICE_DEPLOY_DONE_TTL_MS - age)
           : Math.max(0, SERVICE_DEPLOY_MAX_RUNNING_MS - age);
       return window.setTimeout(() => setServiceDeployState(serviceId, null), delay);
     });
@@ -727,17 +801,35 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return { success: true };
   }, [accounts, addLog, sendCustomAlert]);
 
-  // Sync Projects from Railway API for one or all accounts
-  const syncAccountProjects = useCallback(async (targetAccId?: string) => {
-    setIsSyncingProjects(true);
-    const listToSync = targetAccId && targetAccId !== 'all'
-      ? accounts.filter((a) => a.id === targetAccId)
-      : accounts;
+  // Sync Projects from Railway API for one or all accounts.
+  // Kept in refs so the interval in the effect below can call it without the
+  // effect re-running every time the account list changes — that restart is
+  // what stopped the 30s auto-sync from ever firing.
+  //
+  // The ref is assigned during render (not in an effect) because the initial
+  // sync fires from an effect in the same commit that loads the accounts, and
+  // an effect-based assignment would land one render too late.
+  const accountsRefForSync = useRef<RailwayAccount[]>(accounts);
+  accountsRefForSync.current = accounts;
+  // Which sync scopes are running, so a fast single-account refresh is not
+  // blocked by an unrelated full sweep (and vice versa).
+  const syncInFlightRef = useRef(new Set<string>());
 
-    if (listToSync.length === 0) {
-      setIsSyncingProjects(false);
-      return;
-    }
+  const syncAccountProjects = useCallback(async (targetAccId?: string) => {
+    // A refresh already running is not superseded: a second pass would double
+    // the Railway load these calls are already rate-limited by.
+    const scope = targetAccId && targetAccId !== 'all' ? targetAccId : 'all';
+    if (syncInFlightRef.current.has(scope)) return;
+
+    const allAccounts = accountsRefForSync.current;
+    const listToSync = targetAccId && targetAccId !== 'all'
+      ? allAccounts.filter((a) => a.id === targetAccId)
+      : allAccounts;
+
+    if (listToSync.length === 0) return;
+
+    syncInFlightRef.current.add(scope);
+    setIsSyncingProjects(true);
 
     /** One account's sync. Accounts run CONCURRENTLY (see runWithConcurrency)
      *  — Railway takes seconds per call, so doing 32 accounts back-to-back is
@@ -750,13 +842,14 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         // If Railway was unreachable, keep the existing projects untouched instead
         // of treating the empty result as "everything was deleted".
         if (!res.projects) {
-          if (res.httpStatus === 502 || res.error) {
-            addLog({
-              level: 'warn',
-              serviceName: 'SyncManager',
-              message: `[SYNC_SKIPPED] Railway unreachable for ${acc.name}; kept existing project state. (${res.error || res.httpStatus})`,
-            });
-          }
+          // Surface it: a silent skip is indistinguishable from "nothing
+          // changed", which is exactly why the view looked frozen until the
+          // refresh button was pressed.
+          addLog({
+            level: 'warn',
+            serviceName: 'SyncManager',
+            message: `[SYNC_SKIPPED] همگامسازی ${acc.name} انجام نشد؛ داده قبلی حفظ شد. (${res.error || res.httpStatus || 'بدون پاسخ'})`,
+          });
           return;
         }
 
@@ -868,17 +961,27 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     // 5 in flight: far fewer round trips overall without hammering Railway.
-    await runWithConcurrency(listToSync, 5, syncOne);
-    setIsSyncingProjects(false);
-  }, [accounts, addLog]);
-
-  // Initial Sync Effect once server state has loaded
-  useEffect(() => {
-    if (stateReady && accounts.length > 0) {
-      syncAccountProjects('all');
+    try {
+      await runWithConcurrency(listToSync, 5, syncOne);
+    } finally {
+      // Must run even if a sync throws, or one failure would leave the guard
+      // set and every later refresh (manual or automatic) would be a no-op.
+      syncInFlightRef.current.delete(scope);
+      if (syncInFlightRef.current.size === 0) setIsSyncingProjects(false);
     }
+  }, [addLog]);
+
+  // Initial Sync Effect once server state has loaded. Depends on the account
+// list too: `stateReady` and the loaded accounts land in the same render
+// batch, but the sync reads them from a ref that only updates on the render
+// after — keying on the list as well makes the first sync actually run.
+  const initialSyncDoneRef = useRef(false);
+  useEffect(() => {
+    if (!stateReady || accounts.length === 0 || initialSyncDoneRef.current) return;
+    initialSyncDoneRef.current = true;
+    syncAccountProjects('all');
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stateReady]);
+  }, [stateReady, accounts.length]);
 
   // Refresh Account Balances & Check Budget Guard Triggers
   // Credit figures come from Railway via syncAccountProjects; nothing is simulated locally.
@@ -919,6 +1022,36 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     const newServiceId = serviceData.railwayServiceId || `srv-${Date.now()}`;
+
+    // A deploy announces its service as soon as Railway creates it, so by the
+    // time the flow ends the card already exists — update it instead of
+    // adding a second copy of the same Railway service.
+    const alreadyRegistered = !!serviceData.railwayServiceId &&
+      !!hostAccount?.projects.some((p) => p.services.some((s) => s.id === newServiceId));
+    if (alreadyRegistered) {
+      setAccounts((prev) =>
+        prev.map((acc) => ({
+          ...acc,
+          projects: acc.projects.map((p) => ({
+            ...p,
+            services: p.services.map((s) =>
+              s.id === newServiceId
+                ? {
+                    ...s,
+                    ...(serviceData.domains && serviceData.domains.length > 0
+                      ? { domains: serviceData.domains }
+                      : {}),
+                    envVars: serviceData.envVars || s.envVars,
+                    port: serviceData.port || s.port,
+                    imageOrRepo: serviceData.imageOrRepo || s.imageOrRepo,
+                  }
+                : s
+            ),
+          })),
+        }))
+      );
+      return { success: true };
+    }
     // Real Railway services start with whatever domains were just created (or
     // none — the next sync fills in live domains from Railway). Only fabricate
     // a placeholder for purely local services that have no Railway id yet.
@@ -1083,6 +1216,14 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
         patchService(serviceId, { status: pendingStatus, uptime: pendingLabel });
 
+        // Attach the run to the card so its build status is tracked live —
+        // without this a redeploy from a card only ever changed the pill.
+        setServiceDeployState(serviceId, {
+          status: 'running',
+          phase: pendingLabel,
+          startedAt: Date.now(),
+        });
+
         const res =
           action === 'restart'
             ? await restartRailwayService(params)
@@ -1121,7 +1262,7 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return { success: false, error: message };
       }
     },
-    [findServiceRef, patchService, addLog, syncAccountProjects]
+    [findServiceRef, patchService, addLog, syncAccountProjects, setServiceDeployState]
   );
 
   // Restart Service (deploymentRestart — real container restart on Railway)
@@ -1280,13 +1421,24 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     accountsRef.current = accounts;
   }, [accounts]);
 
+  // Which account is on screen — assigned during render so the pollers below
+  // always read the current value without re-running their effects.
+  const activeIdRef = useRef(activeAccountId);
+  activeIdRef.current = activeAccountId;
+
   useEffect(() => {
     if (!stateReady) return;
 
     const pollRealMetrics = async () => {
+      // Only the account on screen needs live telemetry. Pulling metrics for
+      // every healthy service of all 25 accounts fired hundreds of Railway
+      // calls per cycle, which tripped the API's rate limit — and a
+      // rate-limited sync is what left the dashboard stale.
+      const visibleId = activeIdRef.current;
       const targets: { acc: RailwayAccount; projectId: string; envId: string; srvId: string }[] = [];
       for (const acc of accountsRef.current) {
         if (!acc.token) continue;
+        if (visibleId !== 'all' && acc.id !== visibleId) continue;
         for (const p of acc.projects || []) {
           if (p.isDeletedOnRailway) continue;
           for (const s of p.services || []) {
@@ -1301,7 +1453,7 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const startDate = new Date(endDate.getTime() - 30 * 60 * 1000);
 
       await Promise.all(
-        targets.slice(0, 12).map(async (t) => {
+        targets.slice(0, 6).map(async (t) => {
           try {
             const res = await getRailwayServiceMetrics({
               token: t.acc.token,
@@ -1416,17 +1568,229 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     pollRealMetrics();
-    const timer = setInterval(pollRealMetrics, 30_000);
+    // 60s: metrics charts do not need 30s granularity, and halving this was
+    // the single biggest reduction in Railway calls.
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') pollRealMetrics();
+    }, 60_000);
     return () => clearInterval(timer);
   }, [stateReady]);
 
-  // Periodic Balance Refresh (every 30 seconds)
+  // Live deployment status for cards: while a service's build is actually
+  // running on Railway, read the real status every few seconds and attach it
+  // to that service. Only services with a running deploy are polled, so an
+  // idle dashboard makes no extra requests.
+  const serviceDeployStatesRef = useRef(serviceDeployStates);
   useEffect(() => {
-    const timer = setInterval(() => {
-      refreshAccountBalances();
-    }, 30000);
-    return () => clearInterval(timer);
+    serviceDeployStatesRef.current = serviceDeployStates;
+  }, [serviceDeployStates]);
+
+  useEffect(() => {
+    if (!stateReady) return;
+
+    let cancelled = false;
+
+    const pollLiveDeployments = async () => {
+      const live: {
+        account: RailwayAccount;
+        project: RailwayProject;
+        serviceId: string;
+        state: ServiceDeployState;
+        /** Local start of this card's build, kept stable across polls. */
+        anchor: number;
+      }[] = [];
+
+      for (const acc of accountsRef.current) {
+        if (!acc.token) continue;
+        for (const proj of acc.projects || []) {
+          if (proj.isDeletedOnRailway) continue;
+          for (const srv of proj.services || []) {
+            const state = serviceDeployStatesRef.current[srv.id];
+            const railStatus = (srv.deploymentStatus || '').toUpperCase();
+            // A build started outside this session (or a redeploy straight from
+            // Railway) has no local state — the synced deployment status is
+            // the only hint that something is running, so it is polled too.
+            const liveOnRailway = LIVE_DEPLOY_STATUSES.has(railStatus);
+
+            if (state?.status === 'running' || liveOnRailway) {
+              live.push({
+                account: acc,
+                project: proj,
+                serviceId: srv.id,
+                state:
+                  state ??
+                  ({
+                    status: 'running',
+                    phase: RAILWAY_STAGE_LABELS[railStatus] || railStatus,
+                    startedAt: srv.deploymentStatusAt ? new Date(srv.deploymentStatusAt).getTime() : undefined,
+                  } as ServiceDeployState),
+                anchor: state?.startedAt || state?.updatedAt || Date.now(),
+              });
+            }
+          }
+        }
+      }
+      if (live.length === 0) return;
+
+      // One deployments call per project is enough: the newest deployment of
+      // each service appears in the project's list.
+      const projects = new Map<string, { account: RailwayAccount; project: RailwayProject }>();
+      for (const item of live) projects.set(item.project.id, { account: item.account, project: item.project });
+
+      for (const [projectId, { account, project }] of projects) {
+        try {
+          const res = await getRailwayDeployments({ token: account.token, projectId });
+          if (cancelled) return;
+          if (!Array.isArray(res?.data?.deployments?.edges)) continue;
+
+          const newestByService = new Map<string, any>();
+          for (const edge of res.data.deployments.edges) {
+            const node = edge?.node;
+            if (!node?.serviceId || !node?.status) continue;
+            const prev = newestByService.get(node.serviceId);
+            if (!prev || new Date(node.createdAt || 0) >= new Date(prev.createdAt || 0)) {
+              newestByService.set(node.serviceId, node);
+            }
+          }
+
+          for (const item of live.filter((l) => l.project.id === projectId)) {
+            const dep = newestByService.get(item.serviceId);
+            if (!dep) continue;
+
+            // Ignore a deployment that predates this deploy attempt.
+            const created = new Date(dep.createdAt || 0).getTime();
+            if (Number.isFinite(created) && created < item.anchor - 120_000) continue;
+
+            const status = String(dep.status).toUpperCase();
+            const failed = ['FAILED', 'CRASHED'].includes(status);
+            const phaseOf = deployPhaseFor(status);
+            const prevStageTs = item.state.stageTimestamps || {};
+            // First time this stage is observed, stamp it; later polls keep
+            // the original stamp so the duration is the real one.
+            const stageTimestamps = phaseOf
+              ? { ...prevStageTs, [phaseOf]: prevStageTs[phaseOf] ?? Date.now() }
+              : prevStageTs;
+            const finishedAt =
+              ['SUCCESS', 'FAILED', 'CRASHED', 'REMOVED'].includes(status)
+                ? item.state.finishedAt ?? Date.now()
+                : undefined;
+
+            // A build that dies here never runs, so its runtime logs are
+            // empty — buildLogs is the only account of what went wrong.
+            let buildLogs = item.state.buildLogs;
+            if (failed && !buildLogs) {
+              try {
+                const logRes = await getRailwayBuildLogs({
+                  token: account.token,
+                  deploymentId: dep.id,
+                  limit: 300,
+                });
+                const rows = logRes?.data?.buildLogs;
+                if (Array.isArray(rows) && rows.length > 0) {
+                  buildLogs = rows
+                    .slice(-40)
+                    .map((l: any) => (typeof l?.message === 'string' ? l.message.replace(/\r/g, '') : ''))
+                    .filter(Boolean)
+                    .join('')
+                    .slice(-4000);
+                }
+              } catch {
+                // The failure still shows; only its log is missing.
+              }
+            }
+
+            // updatedAt is set to the anchor by the state setter, so the TTL
+            // in the cleanup effect measures from the build's start and cannot
+            // be reset by this poll (a stuck build still expires).
+            setServiceDeployState(item.serviceId, {
+              ...item.state,
+              updatedAt: item.anchor,
+              railwayStatus: status,
+              deploymentId: dep.id,
+              buildLogs,
+              stageTimestamps,
+              finishedAt,
+              attempt: Number(dep.attempt) || undefined,
+              // Railway reaching a terminal state is authoritative: stop the
+              // spinner even if the flow that started it is still busy.
+              status:
+                status === 'SUCCESS'
+                  ? 'success'
+                  : ['FAILED', 'CRASHED'].includes(status)
+                    ? 'error'
+                    : LIVE_DEPLOY_STATUSES.has(status)
+                      ? 'running'
+                      : item.state.status,
+              phase:
+                status === 'SUCCESS'
+                  ? 'بیلد و دیپلوی روی ریلوی موفق شد'
+                  : ['FAILED', 'CRASHED'].includes(status)
+                    ? `دیپلوی روی ریلوی شکست خورد (${status})`
+                    : status,
+            });
+          }
+        } catch {
+          // One project failing to answer must not stop the others.
+        }
+      }
+    };
+
+    pollLiveDeployments();
+    const timer = window.setInterval(pollLiveDeployments, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [stateReady, setServiceDeployState]);
+
+  // Periodic full refresh (every 30 seconds): accounts, credits and every
+// service's deployment status.
+  //
+  // Depend on nothing that changes often. `refreshAccountBalances` is stable
+  // now, but an interval keyed on state that these very syncs update would be
+  // torn down and recreated before it ever reached its 30s — the reason the
+  // dashboard used to sit on stale data until the refresh button was pressed.
+  const refreshRef = useRef(refreshAccountBalances);
+  useEffect(() => {
+    refreshRef.current = refreshAccountBalances;
   }, [refreshAccountBalances]);
+
+  useEffect(() => {
+    if (!stateReady) return;
+
+    // What the user is actually looking at is the active account, so refresh
+    // THAT frequently. Syncing all 25 accounts every 30s is what tripped
+    // Railway's rate limit (502/500), and a rate-limited sync is skipped —
+    // which is exactly why the view stayed stale until refresh was pressed.
+    const tick = () => {
+      if (document.visibilityState !== 'visible') return;
+      void syncAccountProjects(activeIdRef.current === 'all' ? 'all' : activeIdRef.current);
+    };
+
+    const interval = window.setInterval(tick, 20_000);
+
+    // Coming back to the tab should show current data immediately instead of
+    // waiting for the next tick.
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') tick();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [stateReady, syncAccountProjects]);
+
+  // Full sweep across every account, much less often: balances and projects
+  // of accounts the user is not looking at do not need 30-second freshness.
+  useEffect(() => {
+    if (!stateReady) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshRef.current();
+    }, 5 * 60_000);
+    return () => clearInterval(timer);
+  }, [stateReady]);
 
   const value = {
     accounts,
