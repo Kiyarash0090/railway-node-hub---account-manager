@@ -203,7 +203,7 @@ export function serviceCreateKeyboard(
   const base = { accountId, ...(projectId ? { projectId } : {}) };
   return [
     [btn('🌐 GitHub', chatId, { kind: 'deploy-github', ...base }), btn('🖼 ایمیج', chatId, { kind: 'deploy-image', ...base })],
-    [btn('📦 سورس (.tar.gz)', chatId, { kind: 'deploy-source', ...base }), btn('🐳 Compose', chatId, { kind: 'deploy-compose', ...base })],
+    [btn('📦 سورس (.tar.gz/.zip)', chatId, { kind: 'deploy-source', ...base }), btn('🐳 Compose', chatId, { kind: 'deploy-compose', ...base })],
     ...backKeyboard(chatId, projectId ? 'project-detail' : 'service-list'),
   ];
 }

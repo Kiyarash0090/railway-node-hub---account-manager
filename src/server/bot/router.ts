@@ -26,6 +26,7 @@ import {
 } from './sessions';
 import { splitMessage, truncate } from './format';
 import { extractTarGz } from './tar';
+import { zipToTarGz } from './archive';
 import {
   apiPost,
   getAccounts,
@@ -921,7 +922,7 @@ export async function dispatchCallback(cfg: TelegramConfig, cq: any, fallbackCha
         await tgSendMessage(
           botToken || '',
           String(chatId),
-          'فایل سورس را به‌صورت .tar.gz ارسال کنید.\n(فایل ‎.zip پشتیبانی نمی‌شود)\n\nبرای لغو /cancel',
+          'فایل سورس را به‌صورت Document ارسال کنید:\n.tar.gz، .tgz یا .zip\n\nبرای لغو /cancel',
           platform
         );
         return;
@@ -1229,7 +1230,9 @@ async function handleAwaiting(
     await sendMsg(cfg, chatId, truncate(body, 3900), platform);
   };
 
-  // A file was sent where text was expected: many flows accept both.
+  // A file sent where text was expected: many flows accept both. Telegram
+  // rejects .zip uploads as documents, but Bale allows them, so the archive is
+  // checked for a zip signature as well (Bale reports it as `document` too).
   const document = message?.document;
   const fileId: string | undefined = document?.file_id;
   const fileName: string = document?.file_name || '';
@@ -1354,12 +1357,24 @@ async function handleAwaiting(
     case 'source-tar': {
       const accountId = payload.accountId;
       if (!accountId) return send('اکانتی انتخاب نشده است.');
-      if (!fileId) return send('فایل .tar.gz را به‌صورت Document ارسال کنید.');
-      if (!/\.(tar\.gz|tgz)$/i.test(fileName)) {
-        return send('فقط .tar.gz پشتیبانی می‌شود (zip نه).');
+      if (!fileId) return send('فایل سورس (.tar.gz، .tgz یا .zip) را به‌صورت Document ارسال کنید.');
+      await send('⏳ دریافت سورس و آپلود روی ریلوی… (تا چند دقیقه)');
+      const downloaded = await tgDownloadFileBuffer(botToken || '', fileId, platform);
+
+      // The extension is often missing or mangled by the client, so the file's
+      // own signature decides which archive it is: PK for zip, 1f 8b for gzip.
+      const looksZip = downloaded[0] === 0x50 && downloaded[1] === 0x4b;
+      const looksGzip = downloaded[0] === 0x1f && downloaded[1] === 0x8b;
+      let archive = downloaded;
+      if (looksZip) {
+        try {
+          archive = await zipToTarGz(downloaded);
+        } catch (err: any) {
+          return send(`❌ باز کردن فایل zip ناموفق بود: ${err?.message || err}`);
+        }
+      } else if (!looksGzip) {
+        return send('فایل ارسالی نه zip است و نه tar.gz؛ سورس را به یکی از این دو شکل بفرستید.');
       }
-      await send('⏳ دریافت و آپلود سورس… (تا چند دقیقه)');
-      const archive = await tgDownloadFileBuffer(botToken || '', fileId, platform);
 
       let envFromArchive: Record<string, string> = {};
       try {
@@ -1465,7 +1480,13 @@ async function handleAwaiting(
 /** Build a minimal .env map from files inside a source archive. */
 function readEnvFromArchive(archive: Buffer): Record<string, string> {
   const entries = extractTarGz(archive);
-  const envEntry = entries.find((e) => /(^|\/)\.env(\.example|\.sample)?$/.test(e.name));
+  // Prefer a real `.env` at the project root over a sample further down, the
+  // same way the web client's picker does.
+  const isEnv = (name: string) => /(^|\/)\.env(\.example|\.sample)?$/.test(name);
+  const envEntry =
+    entries.find((e) => /^\.\/\.env$/.test(e.name)) ||
+    entries.find((e) => isEnv(e.name) && !/\.(example|sample)$/.test(e.name)) ||
+    entries.find((e) => isEnv(e.name));
   if (!envEntry) return {};
   const out: Record<string, string> = {};
   for (const line of envEntry.data.toString('utf8').split(/\r?\n/)) {
