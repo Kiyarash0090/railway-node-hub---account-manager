@@ -13,6 +13,7 @@ import { INITIAL_ACCOUNTS, INITIAL_LOGS } from '../constants/initialData';
 import { validateRailwayToken, syncRailwayProjects, deleteRailwayProject, restartRailwayService, redeployRailwayService, manualUpdateRailwayService, stopRailwayService, deleteRailwayService, getRailwayServiceMetrics, getRailwayDeployments, getRailwayBuildLogs } from '../services/railwayApi';
 import { extractApiError } from '../utils/githubRepo';
 import { apiFetch as fetch } from '../services/authApi';
+import { notifyTelegram } from '../services/telegramApi';
 
 /** Global deploy-progress snapshot so the status survives closing DeployModal. */
 export interface DeployJobState {
@@ -454,6 +455,7 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Server-side state: ready flag + load on mount (auth cookie already set by AuthGate)
   const [stateReady, setStateReady] = useState(false);
+  const lastServerVersionRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -478,6 +480,7 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (cancelled) return;
           if (Array.isArray(data.accounts)) setAccounts(data.accounts as RailwayAccount[]);
           if (Array.isArray(data.alerts)) setAlerts(data.alerts as AlertNotification[]);
+          lastServerVersionRef.current = typeof data.updatedAt === 'string' ? data.updatedAt : null;
           if (!cancelled) setStateReady(true);
           return;
         } catch (e) {
@@ -498,18 +501,83 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, []);
 
-  // Debounced persist to server (skip until initial load finishes)
+  // Debounced persist to server (skip until initial load finishes). Sends
+  // baseUpdatedAt so the server returns 409 when another writer (bot) changed
+  // state since we last read it; we then merge instead of clobbering.
   useEffect(() => {
     if (!stateReady) return;
     const t = setTimeout(() => {
-      fetch('/api/state', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accounts, alerts }),
-      }).catch((e) => console.error('Failed to save state to server', e));
+      (async () => {
+        try {
+          const baseUpdatedAt = lastServerVersionRef.current;
+          const res = await fetch('/api/state', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ accounts, alerts, baseUpdatedAt }),
+          });
+          if (res.status === 409) {
+            const body = await res.json();
+            if (body?.code === 'STATE_CONFLICT' && body.state) {
+              // Merge: keep our version for accounts we know, add unknowns from server.
+              const serverAccounts: RailwayAccount[] = body.state.accounts || [];
+              const serverAlerts: AlertNotification[] = body.state.alerts || [];
+              const serverIds = new Set(serverAccounts.map((a: any) => a.id));
+              const localIds = new Set(accounts.map((a: any) => a.id));
+              const mergedAccounts = [
+                ...serverAccounts.filter((a: any) => !localIds.has(a.id)),
+                ...accounts,
+              ];
+              setAccounts(mergedAccounts);
+              setAlerts([...alerts, ...serverAlerts.filter((al) => !alerts.some((x) => x.id === al.id))]);
+              lastServerVersionRef.current = typeof body.state.updatedAt === 'string' ? body.state.updatedAt : null;
+              // Re-trigger persist with the fresh version
+              setTimeout(() => {
+                fetch('/api/state', {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ accounts: mergedAccounts, alerts }),
+                }).catch(() => {});
+              }, 100);
+            }
+            return;
+          }
+          if (res.ok) {
+            const saved = await res.json();
+            if (typeof saved?.updatedAt === 'string') lastServerVersionRef.current = saved.updatedAt;
+          }
+        } catch (e) {
+          console.error('Failed to save state to server', e);
+        }
+      })();
     }, 600);
     return () => clearTimeout(t);
   }, [accounts, alerts, stateReady]);
+
+  // Poll the server state version so bot-made changes show up in the UI.
+  useEffect(() => {
+    if (!stateReady) return;
+    const iv = setInterval(async () => {
+      try {
+        const res = await fetch('/api/state/version');
+        if (!res.ok) return;
+        const data = await res.json();
+        const version = typeof data.version === 'string' ? data.version : null;
+        if (version && lastServerVersionRef.current !== version) {
+          // Refresh: pull the latest state from the server
+          const stateRes = await fetch('/api/state');
+          if (stateRes.ok) {
+            const state = await stateRes.json();
+            if (Array.isArray(state.accounts)) setAccounts(state.accounts as RailwayAccount[]);
+            if (Array.isArray(state.alerts)) setAlerts(state.alerts as AlertNotification[]);
+            lastServerVersionRef.current = typeof state.updatedAt === 'string' ? state.updatedAt : null;
+          }
+        }
+      } catch {
+        // transient — silent
+      }
+    }, 20_000);
+    return () => clearInterval(iv);
+  }, [stateReady]);
 
   useEffect(() => {
     localStorage.setItem(THEME_STORAGE_KEY, theme);
@@ -648,6 +716,8 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       serviceName: serviceName || 'Railway-Alert-System',
       message: `[ALERT] ${title}: ${message}`,
     });
+    // Fire-and-forget push to the Telegram bot (no-op when bot is disabled)
+    notifyTelegram(title, message, severity, serviceName).catch(() => {});
   }, [activeAccount, accounts, addLog]);
 
   // Add Account with Token Validation

@@ -1,53 +1,36 @@
-# Railway Node Hub & Account Manager
+<div align="center">
+<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
+</div>
 
-سامانه مدیریت متمرکز چند اکانته نودها و سرویس‌های Railway همراه با پایش زنده منابع، لاگ‌های لایو، دپلوی هوشمند و پشتیبان‌گیری تلگرام.
+# Run and deploy your AI Studio app
 
-Comprehensive multi-account manager for Railway nodes with live logs, real-time resource metrics, budget guard auto-shutdown, deployment engine, and Telegram backup integration.
+This contains everything you need to run your app locally.
 
----
+View your app in AI Studio: https://ai.studio/apps/877c9c6b-a759-43f1-ac58-057ce486a078
 
-## 🚀 راهنمای نصب و اجرا (Local Development)
+## Run Locally
 
-### پیش‌نیازها (Prerequisites)
-- **Node.js**: نسخه 18 یا بالاتر
+**Prerequisites:**  Node.js
 
-### مراحل اجرا:
-1. **نصب وابستگی‌ها:**
-   ```bash
-   npm install
-   ```
-2. **تنظیم فایل تنظیمات محلی:**
-   فایل `.env.example` را به `.env` یا `.env.local` کپی کرده و در صورت نیاز مقادیر متغیرها را تنظیم کنید:
-   ```bash
-   cp .env.example .env
-   ```
-3. **اجرای برنامه در حالت توسعه:**
-   ```bash
-   npm run dev
-   ```
-   برنامه در آدرس `http://localhost:3000` در دسترس خواهد بود.
 
----
+1. Install dependencies:
+   `npm install`
+2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+3. Run the app:
+   `npm run dev`
 
-## 📦 راهنمای انتشار و ساخت حافظه Volume در Railway
+## Login & Server-side Data
 
-هنگام دپلوی این برنامه روی ریلوی (Railway):
+- **First visit** shows a setup form to create a username + password. Those credentials become the app's permanent login.
+- **Credentials** are stored (hashed) at `AUTH_FILE_PATH` (default `./data/auth.json`).
+- **App state** (Railway accounts + API tokens, alerts) is stored at `STATE_FILE_PATH` (default `./data/hub-state.json`) — not in the browser.
+- All `/api/*` routes (except `/api/health` and `/api/auth/*`) require a valid login session.
 
-1. **ساخت Volume برای ماندگاری اطلاعات:**
-   در پنل ریلوی، روی سرویس خود کلیک کرده و یک **Volume** ایجاد کنید و مسیر آن را `/data` قرار دهید (`Mount Path: /data`).
-2. **تنظیم متغیرهای محیطی (Environment Variables):**
-   متغیرهای زیر را در قسمت Variables اضافه کنید:
+### Railway deploy
+
+1. Create a **Volume** on the service and mount it at `/data`
+2. Set environment variables:
    - `AUTH_FILE_PATH=/data/auth.json`
    - `STATE_FILE_PATH=/data/hub-state.json`
    - `NODE_ENV=production`
-   - `PORT=3000` (اختیاری)
-3. **ورود اولیه:**
-   در اولین ورود، فرم تعریف نام‌کاربری و رمزعبور مدیر نمایش داده می‌شود. اطلاعات حساب شما درون Volume در فایل `/data/auth.json` به‌صورت هش‌شده ذخیره می‌گردد و با ری‌استارت یا دپلوی مجدد پاک نخواهد شد.
-
----
-
-## 🛠 فناوری‌های استفاده‌شده (Tech Stack)
-- **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Lucide Icons, Motion (Framer Motion)
-- **Backend**: Express.js (TypeScript), Server-side State Store with File Persistence
-- **Integration**: Railway GraphQL API, Telegram Bot Backup API
-
+3. First visit after deploy → create username/password → done. Credentials and data survive redeploys via the volume.

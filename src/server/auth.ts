@@ -310,14 +310,48 @@ export function mountAuthRoutes(app: Express): void {
   });
 }
 
+/** Per-process secret used by the in-process Telegram bot to call /api routes
+ *  over loopback without a browser session. Set once at boot via
+ *  setInternalBotSecret(); never persisted. */
+let internalBotSecret: string | null = null;
+
+export function setInternalBotSecret(secret: string): void {
+  internalBotSecret = secret;
+}
+
+export function getInternalBotSecret(): string | null {
+  return internalBotSecret;
+}
+
+function isLoopback(req: Request): boolean {
+  const ip = req.ip || req.socket?.remoteAddress || '';
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
+function verifyInternalBotHeader(req: Request): boolean {
+  if (!internalBotSecret) return false;
+  const header = req.headers['x-internal-bot'];
+  if (typeof header !== 'string' || !header) return false;
+  if (!isLoopback(req)) return false;
+  const a = Buffer.from(header);
+  const b = Buffer.from(internalBotSecret);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function authGuard(req: Request, res: Response, next: NextFunction): void {
   const fullPath = req.originalUrl?.split('?')[0] || req.path;
   if (
     fullPath === '/health' ||
     fullPath === '/api/health' ||
     fullPath.startsWith('/auth/') ||
-    fullPath.startsWith('/api/auth/')
+    fullPath.startsWith('/api/auth/') ||
+    fullPath === '/api/telegram/test'
   ) {
+    next();
+    return;
+  }
+  if (verifyInternalBotHeader(req)) {
+    (req as any).user = '__bot__';
     next();
     return;
   }

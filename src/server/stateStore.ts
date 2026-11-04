@@ -1,11 +1,37 @@
 import fs from 'fs';
 import path from 'path';
-import type { TelegramConfig } from '../types';
+import type { BotMonitorSnapshot, TelegramConfig } from '../types';
 
 export interface HubState {
   accounts: unknown[];
   alerts: unknown[];
   updatedAt: string | null;
+}
+
+/** In-process mutex so bot mutations and web PUTs never clobber each other.
+ *  `fn` receives the raw state object and returns the mutated `accounts` array
+ *  (or the full object); the result is atomically persisted under the lock. */
+let stateLock: Promise<void> = Promise.resolve();
+
+export async function mutateState<T>(fn: (raw: Record<string, unknown>) => T): Promise<T> {
+  let release!: () => void;
+  const next = new Promise<void>((r) => (release = r));
+  const prev = stateLock;
+  stateLock = next;
+  await prev;
+  try {
+    const raw = { ...(readRawState() || {}) };
+    const result = fn(raw);
+    // fn may mutate raw.accounts in place (like syncAccount) or return a new
+    // accounts array (like addAccountFromToken / updateAccountTags /
+    // deleteAccount). Persist whichever accounts array ended up current.
+    if (Array.isArray(result)) raw.accounts = result;
+    const updatedAt = new Date().toISOString();
+    persist({ ...raw, updatedAt });
+    return result;
+  } finally {
+    release();
+  }
 }
 
 export function stateFilePath(): string {
@@ -37,7 +63,10 @@ export function readState(): HubState | null {
 function isTelegramConfig(value: unknown): value is TelegramConfig {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
-  return typeof v.botToken === 'string' && typeof v.chatId === 'string';
+  // Support both Telegram and Bale configurations
+  const hasTelegram = typeof v.telegramBotToken === 'string' && typeof v.telegramChatId === 'string';
+  const hasBale = typeof v.baleBotToken === 'string' && typeof v.baleChatId === 'string';
+  return hasTelegram || hasBale;
 }
 
 export function readTelegram(): TelegramConfig | null {
@@ -56,19 +85,47 @@ function persist(full: Record<string, unknown>): void {
   fs.renameSync(tmp, file);
 }
 
-export function writeState(input: { accounts: unknown[]; alerts: unknown[] }): HubState {
+export function writeState(
+  input: { accounts: unknown[]; alerts: unknown[] },
+  opts?: { baseUpdatedAt?: string | null }
+): HubState | { conflict: true; state: Record<string, unknown> } {
   const prev = readRawState();
+  if (opts?.baseUpdatedAt && prev?.updatedAt && opts.baseUpdatedAt !== prev.updatedAt) {
+    return { conflict: true, state: prev || {} };
+  }
   const updatedAt = new Date().toISOString();
   persist({
     accounts: input.accounts,
     alerts: input.alerts,
-    // The client PUTs {accounts, alerts} on every change; keep the telegram
-    // block across those rewrites or config/backup metadata is wiped within
-    // a second of being saved.
     ...(prev && prev.telegram !== undefined ? { telegram: prev.telegram } : {}),
+    ...(prev && prev.botMonitor !== undefined ? { botMonitor: prev.botMonitor } : {}),
     updatedAt,
   });
   return { accounts: input.accounts, alerts: input.alerts, updatedAt };
+}
+
+export function readStateVersion(): string | null {
+  const data = readRawState();
+  return typeof data?.updatedAt === 'string' ? data.updatedAt : null;
+}
+
+export function readBotSettings(): TelegramConfig | null {
+  return readTelegram();
+}
+
+export function writeBotSettings(cfg: TelegramConfig): TelegramConfig {
+  return writeTelegram(cfg);
+}
+
+export function readBotMonitorSnapshot(): BotMonitorSnapshot | null {
+  const data = readRawState();
+  if (!data || !data.botMonitor || typeof data.botMonitor !== 'object') return null;
+  return data.botMonitor as BotMonitorSnapshot;
+}
+
+export function writeBotMonitorSnapshot(snapshot: BotMonitorSnapshot): void {
+  const prev = readRawState() || {};
+  persist({ ...prev, botMonitor: snapshot, updatedAt: new Date().toISOString() });
 }
 
 export function writeTelegram(cfg: TelegramConfig): TelegramConfig {

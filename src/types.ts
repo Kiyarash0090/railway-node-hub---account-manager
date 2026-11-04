@@ -152,15 +152,46 @@ export function creditResetLabel(iso?: string | null): string | null {
   }
 }
 
-/** Telegram bot connection + last-backup metadata, stored under the top-level
- *  `telegram` key of the hub state file. */
+/** Bot connection + last-backup metadata, stored under the top-level
+ *  `telegram` key of the hub state file. Supports simultaneous Telegram and Bale. */
 export interface TelegramConfig {
-  botToken: string;
-  chatId: string;
+  /** Telegram bot token and settings */
+  telegramBotToken?: string;
+  telegramChatId?: string;
+  telegramLastUpdateOffset?: number;
+  /** Enable/disable Telegram bot independently */
+  telegramEnabled?: boolean;
+
+  /** Bale bot token and settings */
+  baleBotToken?: string;
+  baleChatId?: string;
+  baleLastUpdateOffset?: number;
+  /** Enable/disable Bale bot independently */
+  baleEnabled?: boolean;
+
   lastBackupAt?: string | null;
   lastBackupFileId?: string | null;
   lastBackupFileName?: string | null;
   lastBackupMessageId?: number | null;
+  /** Master switch for the in-process bot (long polling). */
+  botEnabled?: boolean;
+  /** Chat ids allowed to talk to the bot. Falls back to [chatId] when empty. */
+  adminChatIds?: string[];
+  /** Send alert/monitor notifications to admins. */
+  notificationsEnabled?: boolean;
+  /** Periodic account/service monitor inside the bot process. */
+  monitorEnabled?: boolean;
+  /** Minutes between monitor sweeps (default 5). */
+  monitorIntervalMinutes?: number;
+  /** Credit remaining ratio that triggers an alert (default 0.1 = 10%). */
+  creditAlertThreshold?: number;
+}
+
+/** Snapshot used by the bot monitor to diff service/credit state between sweeps. */
+export interface BotMonitorSnapshot {
+  services: Record<string, { status: string; deploymentId?: string | null }>;
+  credits: Record<string, { remaining: number; limit: number }>;
+  updatedAt: string;
 }
 
 export interface AlertNotification {

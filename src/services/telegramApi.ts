@@ -33,14 +33,62 @@ export async function saveTelegramConfig(botToken: string, chatId: string): Prom
   return data.telegram;
 }
 
+export interface BotSettings {
+  botEnabled: boolean;
+  adminChatIds: string[];
+  notificationsEnabled: boolean;
+  monitorEnabled: boolean;
+  monitorIntervalMinutes: number;
+  creditAlertThreshold: number;
+  telegramBotToken?: string;
+  telegramChatId?: string;
+  telegramEnabled?: boolean;
+  baleBotToken?: string;
+  baleChatId?: string;
+  baleEnabled?: boolean;
+}
+
+export async function getBotStatus(): Promise<{
+  configured: boolean;
+  enabled: boolean;
+  monitorEnabled: boolean;
+  notificationsEnabled: boolean;
+}> {
+  return jsonFetch('/api/telegram/bot-status');
+}
+
+export async function notifyTelegram(
+  title: string,
+  message: string,
+  severity?: 'info' | 'warning' | 'critical',
+  serviceName?: string
+): Promise<void> {
+  await fetch('/api/telegram/notify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title, message, severity, serviceName }),
+  });
+}
+
+export async function saveBotSettings(settings: BotSettings): Promise<TelegramConfig> {
+  const data = await jsonFetch('/api/telegram/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  return data.telegram;
+}
+
 export async function testTelegramConnection(
-  botToken: string,
-  chatId: string
-): Promise<{ botUsername: string; messageSent: boolean }> {
+  telegramBotToken?: string,
+  telegramChatId?: string,
+  baleBotToken?: string,
+  baleChatId?: string
+): Promise<{ telegram?: { ok: boolean; botUsername?: string; messageSent?: boolean; error?: string }; bale?: { ok: boolean; botUsername?: string; messageSent?: boolean; error?: string } }> {
   return jsonFetch('/api/telegram/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ botToken, chatId }),
+    body: JSON.stringify({ telegramBotToken, telegramChatId, baleBotToken, baleChatId }),
   });
 }
 

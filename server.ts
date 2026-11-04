@@ -12,9 +12,20 @@ import {
   writeTelegram,
   restoreState,
   stateFilePath,
+  readStateVersion,
+  readBotSettings,
+  writeBotSettings,
 } from './src/server/stateStore';
-import { tgGetMe, tgSendMessage, tgSendDocument, tgDownloadFile, tgErrorToPersian } from './src/server/telegram';
+import { tgGetMe, tgSendMessage, tgSendDocument, tgDownloadFile, tgErrorToPersian, botApi } from './src/server/telegram';
 import { normalizeGitHubRepo } from './src/utils/githubRepo';
+import {
+  initInternalSecret,
+  startBot,
+  stopBot,
+  restartBot,
+  setPort as setBotPort,
+  notifyAdmins,
+} from './src/server/bot';
 
 dotenv.config();
 
@@ -119,6 +130,12 @@ function computeCreditExpiresInDays(customer: any): number | null {
 async function startServer() {
   const app = express();
 
+  // Per-process internal secret: lets the in-process bot call /api routes over
+  // loopback without a browser session (see auth.verifyInternalBotHeader).
+  initInternalSecret();
+  setBotPort(PORT);
+  startBot();
+
   // 10mb: default 100kb would reject state-restore payloads before any
   // route-level parser could see them (global parser runs first).
   app.use(express.json({ limit: '10mb' }));
@@ -153,19 +170,37 @@ async function startServer() {
 
   app.put('/api/state', (req, res) => {
     try {
-      const { accounts, alerts } = req.body || {};
+      const { accounts, alerts, baseUpdatedAt } = req.body || {};
       if (!Array.isArray(accounts)) {
         return res.status(400).json({ error: 'accounts must be an array' });
       }
-      const saved = writeState({
-        accounts,
-        alerts: Array.isArray(alerts) ? alerts : [],
-      });
-      res.json({ success: true, updatedAt: saved.updatedAt });
+      const saved = writeState(
+        { accounts, alerts: Array.isArray(alerts) ? alerts : [] },
+        baseUpdatedAt ? { baseUpdatedAt } : undefined
+      );
+      if ('conflict' in saved && saved.conflict) {
+        return res.status(409).json({ code: 'STATE_CONFLICT', state: saved.state });
+      }
+      res.json({ success: true, updatedAt: (saved as any).updatedAt });
     } catch (err: any) {
       console.error('State save error:', err);
       res.status(500).json({ error: err.message || 'Failed to save state' });
     }
+  });
+
+  app.get('/api/state/version', (req, res) => {
+    res.json({ version: readStateVersion() });
+  });
+
+  // Bot health + status (used by the UI to show polling / last-error state).
+  app.get('/api/telegram/bot-status', (req, res) => {
+    const cfg = readBotSettings();
+    res.json({
+      configured: !!(cfg?.telegramBotToken && cfg?.telegramChatId) || !!(cfg?.baleBotToken && cfg?.baleChatId),
+      enabled: cfg?.botEnabled === true,
+      monitorEnabled: cfg?.monitorEnabled === true,
+      notificationsEnabled: cfg?.notificationsEnabled !== false,
+    });
   });
 
   // --- Telegram config + database backup / restore -------------------------
@@ -200,48 +235,124 @@ async function startServer() {
 
   app.put('/api/telegram/config', (req, res) => {
     try {
-      const botToken = String(req.body?.botToken ?? '').trim();
-      const chatId = String(req.body?.chatId ?? '').trim();
-      if (!botToken || !chatId) {
-        return res.status(400).json({ error: 'توکن ربات و شناسه چت را وارد کنید' });
-      }
+      const body = req.body || {};
       const prev = readTelegram();
-      // Backups are addressed by file_id, which is only valid for the bot that
-      // uploaded them — changing the token invalidates the recorded backup.
-      const tokenChanged = !!prev && prev.botToken !== botToken;
-      const telegram = writeTelegram({
-        botToken,
-        chatId,
-        lastBackupAt: tokenChanged ? null : (prev?.lastBackupAt ?? null),
-        lastBackupFileId: tokenChanged ? null : (prev?.lastBackupFileId ?? null),
-        lastBackupFileName: tokenChanged ? null : (prev?.lastBackupFileName ?? null),
-        lastBackupMessageId: tokenChanged ? null : (prev?.lastBackupMessageId ?? null),
+
+      // Telegram config
+      const telegramBotToken = String(body.telegramBotToken ?? '').trim() || (prev?.telegramBotToken ?? '');
+      const telegramChatId = String(body.telegramChatId ?? '').trim() || (prev?.telegramChatId ?? '');
+
+      // Bale config
+      const baleBotToken = String(body.baleBotToken ?? '').trim() || (prev?.baleBotToken ?? '');
+      const baleChatId = String(body.baleChatId ?? '').trim() || (prev?.baleChatId ?? '');
+
+      if (!telegramBotToken && !baleBotToken) {
+        return res.status(400).json({ error: 'حداقل یک توکن ربات (تلگرام یا بله) را وارد کنید' });
+      }
+      if (!telegramChatId && !baleChatId) {
+        return res.status(400).json({ error: 'حداقل یک شناسه چت (تلگرام یا بله) را وارد کنید' });
+      }
+
+      // Check if token changed
+      const telegramTokenChanged = !!prev && prev.telegramBotToken !== telegramBotToken;
+      const baleTokenChanged = !!prev && prev.baleBotToken !== baleBotToken;
+
+      const telegram = writeBotSettings({
+        telegramBotToken: telegramBotToken || undefined,
+        telegramChatId: telegramChatId || undefined,
+        telegramEnabled: body.telegramEnabled !== undefined ? !!body.telegramEnabled : (prev?.telegramEnabled ?? true),
+        telegramLastUpdateOffset: telegramTokenChanged ? 0 : (prev?.telegramLastUpdateOffset ?? 0),
+        baleBotToken: baleBotToken || undefined,
+        baleChatId: baleChatId || undefined,
+        baleEnabled: body.baleEnabled !== undefined ? !!body.baleEnabled : (prev?.baleEnabled ?? true),
+        baleLastUpdateOffset: baleTokenChanged ? 0 : (prev?.baleLastUpdateOffset ?? 0),
+        lastBackupAt: telegramTokenChanged || baleTokenChanged ? null : (prev?.lastBackupAt ?? null),
+        lastBackupFileId: telegramTokenChanged || baleTokenChanged ? null : (prev?.lastBackupFileId ?? null),
+        lastBackupFileName: telegramTokenChanged || baleTokenChanged ? null : (prev?.lastBackupFileName ?? null),
+        lastBackupMessageId: telegramTokenChanged || baleTokenChanged ? null : (prev?.lastBackupMessageId ?? null),
+        botEnabled: body.botEnabled !== undefined ? !!body.botEnabled : (prev?.botEnabled ?? false),
+        adminChatIds: Array.isArray(body.adminChatIds)
+          ? body.adminChatIds.map((x: unknown) => String(x)).filter(Boolean)
+          : (prev?.adminChatIds ?? []),
+        notificationsEnabled:
+          body.notificationsEnabled !== undefined ? !!body.notificationsEnabled : (prev?.notificationsEnabled ?? true),
+        monitorEnabled:
+          body.monitorEnabled !== undefined ? !!body.monitorEnabled : (prev?.monitorEnabled ?? false),
+        monitorIntervalMinutes:
+          body.monitorIntervalMinutes !== undefined
+            ? Number(body.monitorIntervalMinutes)
+            : (prev?.monitorIntervalMinutes ?? 5),
+        creditAlertThreshold:
+          body.creditAlertThreshold !== undefined
+            ? Number(body.creditAlertThreshold)
+            : (prev?.creditAlertThreshold ?? 0.1),
       });
+      restartBot();
       res.json({ success: true, telegram });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'ذخیره تنظیمات ناموفق بود' });
     }
   });
 
+  /** Bot-driven notification: any internal caller pushes an alert to admins. */
+  app.post('/api/telegram/notify', (req, res) => {
+    const { title, message, severity, serviceName } = req.body || {};
+    if (!title && !message) {
+      return res.status(400).json({ error: 'title or message is required' });
+    }
+    const cfg = readBotSettings();
+    const hasBotToken = !!(cfg?.telegramBotToken || cfg?.baleBotToken);
+    if (!hasBotToken || cfg.notificationsEnabled === false) {
+      return res.json({ success: false, skipped: 'disabled' });
+    }
+    const body = [message, serviceName ? `— ${serviceName}` : ''].filter(Boolean).join(' ');
+    notifyAdmins(String(title || 'اعلان'), body, (severity as any) || 'info');
+    res.json({ success: true });
+  });
+
   app.post('/api/telegram/test', async (req, res) => {
     try {
       const stored = readTelegram();
-      const botToken = String(req.body?.botToken ?? '').trim() || stored?.botToken || '';
-      const chatId = String(req.body?.chatId ?? '').trim() || stored?.chatId || '';
-      if (!botToken) {
-        return res.status(400).json({ error: 'توکن ربات وارد نشده است' });
+      const telegramBotToken = String(req.body?.telegramBotToken ?? '').trim() || stored?.telegramBotToken || '';
+      const telegramChatId = String(req.body?.telegramChatId ?? '').trim() || stored?.telegramChatId || '';
+      const baleBotToken = String(req.body?.baleBotToken ?? '').trim() || stored?.baleBotToken || '';
+      const baleChatId = String(req.body?.baleChatId ?? '').trim() || stored?.baleChatId || '';
+
+      const results: Record<string, any> = {};
+
+      if (telegramBotToken) {
+        try {
+          const me = await tgGetMe(telegramBotToken);
+          let messageSent = false;
+          if (telegramChatId) {
+            await tgSendMessage(telegramBotToken, telegramChatId, `اتصال موفق ✅\nربات ${me.username ? '@' + me.username : ''} به Railway Hub متصل شد.`, 'telegram');
+            messageSent = true;
+          }
+          results.telegram = { ok: true, botUsername: me.username, messageSent };
+        } catch (err) {
+          results.telegram = { ok: false, error: tgErrorToPersian(err) };
+        }
       }
-      const me = await tgGetMe(botToken);
-      let messageSent = false;
-      if (chatId) {
-        await tgSendMessage(
-          botToken,
-          chatId,
-          `اتصال موفق ✅\nربات ${me.username ? '@' + me.username : ''} به Railway Hub متصل شد.`
-        );
-        messageSent = true;
+
+      if (baleBotToken) {
+        try {
+          const me = await botApi<any>(baleBotToken, 'getMe', undefined, 'bale');
+          let messageSent = false;
+          if (baleChatId) {
+            await tgSendMessage(baleBotToken, baleChatId, `اتصال موفق ✅\nربات ${me.username ? '@' + me.username : ''} به Railway Hub متصل شد.`, 'bale');
+            messageSent = true;
+          }
+          results.bale = { ok: true, botUsername: me.username, messageSent };
+        } catch (err) {
+          results.bale = { ok: false, error: tgErrorToPersian(err) };
+        }
       }
-      res.json({ ok: true, botUsername: me.username, messageSent });
+
+      if (!telegramBotToken && !baleBotToken) {
+        return res.status(400).json({ error: 'حداقل یک توکن ربات وارد نشده است' });
+      }
+
+      res.json(results);
     } catch (err) {
       res.status(400).json({ error: tgErrorToPersian(err) });
     }
@@ -250,10 +361,13 @@ async function startServer() {
   app.post('/api/telegram/backup', async (req, res) => {
     try {
       const cfg = readTelegram();
-      if (!cfg?.botToken || !cfg?.chatId) {
+      const hasTelegram = !!cfg?.telegramBotToken && !!cfg?.telegramChatId;
+      const hasBale = !!cfg?.baleBotToken && !!cfg?.baleChatId;
+
+      if (!hasTelegram && !hasBale) {
         return res.status(400).json({
           code: 'TELEGRAM_NOT_CONFIGURED',
-          error: 'ابتدا تنظیمات اتصال تلگرام را ذخیره کنید',
+          error: 'ابتدا تنظیمات اتصال یک پلتفرم را ذخیره کنید',
         });
       }
 
@@ -262,26 +376,53 @@ async function startServer() {
       if (exists && !state) {
         return res.status(500).json({ error: 'فایل دیتابیس خوانا نیست' });
       }
-      // Self-contained backup: current state + the telegram block itself.
+
       const payload = {
         ...(state || { accounts: [], alerts: [] }),
         telegram: cfg,
       };
       const fileName = `hub-state-${backupStamp()}.json`;
-      const sent = await tgSendDocument(cfg.botToken, cfg.chatId, JSON.stringify(payload, null, 2), fileName);
-      if (!sent.fileId) {
-        return res.status(502).json({ error: 'پاسخ تلگرام فاقد شناسه فایل بود؛ دوباره تلاش کنید' });
+      const results: Record<string, any> = {};
+
+      if (hasTelegram) {
+        try {
+          const sent = await tgSendDocument(cfg.telegramBotToken || '', cfg.telegramChatId || '', JSON.stringify(payload, null, 2), fileName, 'telegram');
+          if (sent.fileId) {
+            results.telegram = { success: true, fileId: sent.fileId, fileName: sent.fileName, messageId: sent.messageId };
+          } else {
+            results.telegram = { success: false, error: 'شناسه فایل برنگشت' };
+          }
+        } catch (err) {
+          results.telegram = { success: false, error: tgErrorToPersian(err) };
+        }
+      }
+
+      if (hasBale) {
+        try {
+          const sent = await tgSendDocument(cfg.baleBotToken || '', cfg.baleChatId || '', JSON.stringify(payload, null, 2), fileName, 'bale');
+          if (sent.fileId) {
+            results.bale = { success: true, fileId: sent.fileId, fileName: sent.fileName, messageId: sent.messageId };
+          } else {
+            results.bale = { success: false, error: 'شناسه فایل برنگشت' };
+          }
+        } catch (err) {
+          results.bale = { success: false, error: tgErrorToPersian(err) };
+        }
       }
 
       const lastBackupAt = new Date().toISOString();
+      const telegramResult = results.telegram?.success ? results.telegram : null;
+      const baleResult = results.bale?.success ? results.bale : null;
+
       writeTelegram({
         ...cfg,
         lastBackupAt,
-        lastBackupFileId: sent.fileId,
-        lastBackupFileName: sent.fileName,
-        lastBackupMessageId: sent.messageId,
+        lastBackupFileId: telegramResult?.fileId || baleResult?.fileId || undefined,
+        lastBackupFileName: telegramResult?.fileName || baleResult?.fileName || undefined,
+        lastBackupMessageId: telegramResult?.messageId || baleResult?.messageId || undefined,
       });
-      res.json({ success: true, lastBackupAt, fileName: sent.fileName });
+
+      res.json({ success: true, lastBackupAt, fileName, results });
     } catch (err) {
       res.status(400).json({ error: tgErrorToPersian(err) });
     }
@@ -290,27 +431,57 @@ async function startServer() {
   app.post('/api/telegram/restore', async (req, res) => {
     try {
       const cfg = readTelegram();
-      if (!cfg?.botToken) {
+      const hasTelegram = !!cfg?.telegramBotToken;
+      const hasBale = !!cfg?.baleBotToken;
+
+      if (!hasTelegram && !hasBale) {
         return res.status(400).json({
           code: 'TELEGRAM_NOT_CONFIGURED',
-          error: 'ابتدا تنظیمات اتصال تلگرام را ذخیره کنید',
-        });
-      }
-      if (!cfg.lastBackupFileId) {
-        return res.status(400).json({
-          code: 'NO_BACKUP_RECORDED',
-          error: 'هنوز پشتیبانی در تلگرام ثبت نشده است؛ اول یک بک‌اپ بگیرید',
+          error: 'ابتدا تنظیمات اتصال یک پلتفرم را ذخیره کنید',
         });
       }
 
-      const text = await tgDownloadFile(cfg.botToken, cfg.lastBackupFileId);
+      if (!cfg.lastBackupFileId) {
+        return res.status(400).json({
+          code: 'NO_BACKUP_RECORDED',
+          error: 'هنوز پشتیبانی ثبت نشده است؛ اول یک بک‌اپ بگیرید',
+        });
+      }
+
+      let text: string | null = null;
+
+      // Try Telegram first if available
+      if (hasTelegram && cfg.telegramBotToken) {
+        try {
+          text = await tgDownloadFile(cfg.telegramBotToken, cfg.lastBackupFileId, 'telegram');
+        } catch (err) {
+          console.log('[bot] Telegram restore failed, trying Bale:', err);
+        }
+      }
+
+      // Try Bale if Telegram failed or not available
+      if (!text && hasBale && cfg.baleBotToken) {
+        try {
+          text = await tgDownloadFile(cfg.baleBotToken, cfg.lastBackupFileId, 'bale');
+        } catch (err) {
+          console.log('[bot] Bale restore failed:', err);
+        }
+      }
+
+      if (!text) {
+        return res.status(400).json({
+          code: 'DOWNLOAD_FAILED',
+          error: 'دانلود فایل بک‌اپ ناموفق بود',
+        });
+      }
+
       let parsed: unknown;
       try {
         parsed = JSON.parse(text);
       } catch {
         return res.status(400).json({
           code: 'INVALID_BACKUP_FILE',
-          error: 'فایل بک‌اپ دریافتی از تلگرام JSON معتبر نیست',
+          error: 'فایل بک‌اپ دریافتی JSON معتبر نیست',
         });
       }
 
