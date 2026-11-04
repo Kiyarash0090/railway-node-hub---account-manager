@@ -456,6 +456,8 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Server-side state: ready flag + load on mount (auth cookie already set by AuthGate)
   const [stateReady, setStateReady] = useState(false);
   const lastServerVersionRef = useRef<string | null>(null);
+  // Track recently deleted projects to prevent them from being restored by sync/polling
+  const recentlyDeletedProjectsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -504,10 +506,14 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Debounced persist to server (skip until initial load finishes). Sends
   // baseUpdatedAt so the server returns 409 when another writer (bot) changed
   // state since we last read it; we then merge instead of clobbering.
+  const saveInFlightRef = useRef(false);
   useEffect(() => {
     if (!stateReady) return;
     const t = setTimeout(() => {
       (async () => {
+        // Prevent concurrent saves that cause 409 loops
+        if (saveInFlightRef.current) return;
+        saveInFlightRef.current = true;
         try {
           const baseUpdatedAt = lastServerVersionRef.current;
           const res = await fetch('/api/state', {
@@ -519,26 +525,43 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             const body = await res.json();
             if (body?.code === 'STATE_CONFLICT' && body.state) {
               // Merge: keep our version for accounts we know, add unknowns from server.
+              // Project-level merge: if local deleted a project, keep it deleted.
               const serverAccounts: RailwayAccount[] = body.state.accounts || [];
               const serverAlerts: AlertNotification[] = body.state.alerts || [];
               const serverIds = new Set(serverAccounts.map((a: any) => a.id));
               const localIds = new Set(accounts.map((a: any) => a.id));
+
+              // Merge accounts with project-level awareness
               const mergedAccounts = [
+                // Add server accounts that client doesn't know about
                 ...serverAccounts.filter((a: any) => !localIds.has(a.id)),
-                ...accounts,
+                // Keep all local accounts (they have the latest changes)
+                ...accounts.map((localAcc) => {
+                  const serverAcc = serverAccounts.find((sa: any) => sa.id === localAcc.id);
+                  if (!serverAcc) return localAcc;
+
+                  // Merge projects: local deletions win, server additions win
+                  // But respect recently deleted projects - don't restore them
+                  const localProjIds = new Set(localAcc.projects.map(p => p.id));
+                  const serverProjIds = new Set(serverAcc.projects?.map((p: any) => p.id) || []);
+
+                  const mergedProjects = [
+                    // Keep all local projects (including local deletions)
+                    ...localAcc.projects,
+                    // Add server projects that local doesn't have (and weren't recently deleted)
+                    ...(serverAcc.projects || []).filter((sp: any) =>
+                      !localProjIds.has(sp.id) && !recentlyDeletedProjectsRef.current.has(sp.id)
+                    )
+                  ];
+
+                  return { ...localAcc, projects: mergedProjects };
+                }),
               ];
+
               const mergedAlerts = [...alerts, ...serverAlerts.filter((al) => !alerts.some((x) => x.id === al.id))];
               setAccounts(mergedAccounts);
               setAlerts(mergedAlerts);
               lastServerVersionRef.current = typeof body.state.updatedAt === 'string' ? body.state.updatedAt : null;
-              // Re-trigger persist with the fresh version + merged alerts
-              setTimeout(() => {
-                fetch('/api/state', {
-                  method: 'PUT',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ accounts: mergedAccounts, alerts: mergedAlerts }),
-                }).catch(() => {});
-              }, 100);
             }
             return;
           }
@@ -548,6 +571,8 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
         } catch (e) {
           console.error('Failed to save state to server', e);
+        } finally {
+          saveInFlightRef.current = false;
         }
       })();
     }, 600);
@@ -568,7 +593,14 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const stateRes = await fetch('/api/state');
           if (stateRes.ok) {
             const state = await stateRes.json();
-            if (Array.isArray(state.accounts)) setAccounts(state.accounts as RailwayAccount[]);
+            if (Array.isArray(state.accounts)) {
+              // Filter out recently deleted projects from server state
+              const filteredAccounts = state.accounts.map((acc: any) => ({
+                ...acc,
+                projects: (acc.projects || []).filter((p: any) => !recentlyDeletedProjectsRef.current.has(p.id))
+              }));
+              setAccounts(filteredAccounts as RailwayAccount[]);
+            }
             if (Array.isArray(state.alerts)) setAlerts(state.alerts as AlertNotification[]);
             lastServerVersionRef.current = typeof state.updatedAt === 'string' ? state.updatedAt : null;
           }
@@ -851,15 +883,39 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: message };
     }
 
-    setAccounts((prev) =>
-      prev.map((acc) => {
-        if (acc.id !== accountId) return acc;
-        return {
-          ...acc,
-          projects: acc.projects.filter((p) => p.id !== projectId),
-        };
-      })
-    );
+    // Track this deleted project to prevent sync/polling from restoring it
+    recentlyDeletedProjectsRef.current.add(projectId);
+    // Auto-clear after 2 minutes (enough time for all pollers to sync)
+    setTimeout(() => {
+      recentlyDeletedProjectsRef.current.delete(projectId);
+    }, 120_000);
+
+    const updatedAccounts = accounts.map((acc) => {
+      if (acc.id !== accountId) return acc;
+      return {
+        ...acc,
+        projects: acc.projects.filter((p) => p.id !== projectId),
+      };
+    });
+
+    setAccounts(updatedAccounts);
+
+    // Immediate save to server (bypass debounce to prevent race condition)
+    (async () => {
+      try {
+        await fetch('/api/state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accounts: updatedAccounts,
+            alerts,
+            baseUpdatedAt: lastServerVersionRef.current
+          }),
+        });
+      } catch (e) {
+        console.error('Failed to immediately save project deletion', e);
+      }
+    })();
 
     addLog({
       level: 'warn',
@@ -870,7 +926,7 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     sendCustomAlert('پروژه حذف شد', `پروژه ${targetProj.name} با موفقیت حذف گردید.`, 'warning');
 
     return { success: true };
-  }, [accounts, addLog, sendCustomAlert]);
+  }, [accounts, alerts, addLog, sendCustomAlert]);
 
   // Sync Projects from Railway API for one or all accounts.
   // Kept in refs so the interval in the effect below can call it without the
@@ -935,8 +991,11 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               const existingProjs = account.projects || [];
               const projMap = new Map<string, RailwayProject>();
 
-              // Set fetched projects
+              // Set fetched projects (ignore recently deleted ones)
               fetchedProjects.forEach((fp: any) => {
+                // Skip projects that were just deleted by user
+                if (recentlyDeletedProjectsRef.current.has(fp.id)) return;
+
                 const formattedServices: RailwayService[] = (fp.services || []).map((s: any) => ({
                   ...s,
                   projectId: fp.id,
@@ -962,7 +1021,9 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
               // Check existing projects: if any external project is missing from fetched, mark as deleted on railway.
               // Legacy hub-local projects (no isExternal) are dropped — the hub no longer owns projects.
+              // Skip recently deleted projects - they should stay deleted regardless of Railway state.
               existingProjs.forEach((ep) => {
+                if (recentlyDeletedProjectsRef.current.has(ep.id)) return;
                 if (!fetchedIds.has(ep.id)) {
                   if (ep.isExternal) {
                     projMap.set(ep.id, {
