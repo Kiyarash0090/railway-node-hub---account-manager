@@ -527,15 +527,16 @@ export const HubProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 ...serverAccounts.filter((a: any) => !localIds.has(a.id)),
                 ...accounts,
               ];
+              const mergedAlerts = [...alerts, ...serverAlerts.filter((al) => !alerts.some((x) => x.id === al.id))];
               setAccounts(mergedAccounts);
-              setAlerts([...alerts, ...serverAlerts.filter((al) => !alerts.some((x) => x.id === al.id))]);
+              setAlerts(mergedAlerts);
               lastServerVersionRef.current = typeof body.state.updatedAt === 'string' ? body.state.updatedAt : null;
-              // Re-trigger persist with the fresh version
+              // Re-trigger persist with the fresh version + merged alerts
               setTimeout(() => {
                 fetch('/api/state', {
                   method: 'PUT',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ accounts: mergedAccounts, alerts }),
+                  body: JSON.stringify({ accounts: mergedAccounts, alerts: mergedAlerts }),
                 }).catch(() => {});
               }, 100);
             }
