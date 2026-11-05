@@ -174,6 +174,8 @@ export async function readZipArchive(file: File): Promise<SourceEntry[]> {
   return readZipEntries(new Uint8Array(await file.arrayBuffer()), MAX_SOURCE_BYTES);
 }
 
+export { parseDockerfile, findAndParseDockerfile, type DockerfileConfig } from './dockerfileParser';
+
 /** Reads any supported selection into source entries. */
 export async function readSourceSelection(selection: {
   kind: 'directory' | 'zip';

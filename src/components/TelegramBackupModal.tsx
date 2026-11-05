@@ -252,11 +252,17 @@ export const TelegramBackupModal: React.FC<TelegramBackupModalProps> = ({ isOpen
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 backdrop-blur-md modal-backdrop-anim">
-      <div className="w-[94vw] max-w-2xl rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-6 shadow-2xl overflow-y-auto max-h-[90vh] modal-content-anim">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
-          <div className="flex items-center gap-2">
+    <div
+      className="fixed inset-0 z-[2000] flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-md modal-backdrop-anim"
+      onClick={onClose}
+    >
+      <div
+        className="w-[94vw] max-w-2xl rounded-3xl border border-neutral-800 bg-neutral-900 shadow-2xl overflow-hidden max-h-[88vh] max-h-[88dvh] modal-content-anim flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Pinned Modal Header */}
+        <div className="flex items-center justify-between px-4 sm:px-6 py-3.5 sm:py-4 bg-neutral-900 border-b border-neutral-800 shrink-0">
+          <div className="flex items-center gap-2.5">
             <div className="flex h-9 w-9 items-center justify-center rounded-2xl bg-sky-500/20 text-sky-400 ring-1 ring-sky-500/30 shrink-0">
               <Send className="h-4 w-4 sm:h-5 sm:w-5" />
             </div>
@@ -273,7 +279,8 @@ export const TelegramBackupModal: React.FC<TelegramBackupModalProps> = ({ isOpen
           </button>
         </div>
 
-        <div className="space-y-4">
+        {/* Scrollable Modal Body */}
+        <div className="p-4 sm:p-6 overflow-y-auto space-y-4 flex-1 custom-scrollbar">
           {/* Restored success card */}
           {restored && (
             <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 flex items-center gap-2.5 text-xs text-emerald-300">

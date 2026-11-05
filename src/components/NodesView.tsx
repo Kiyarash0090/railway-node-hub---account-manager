@@ -1906,7 +1906,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
       {/* Lifecycle action toast (restart/redeploy/stop/delete result) */}
       {cardActionToast && (
         <div
-          className={`fixed bottom-5 left-1/2 -translate-x-1/2 z-[60] rounded-xl border px-4 py-2.5 text-xs font-semibold shadow-2xl backdrop-blur-md max-w-[90vw] ${
+          className={`fixed bottom-5 left-1/2 -translate-x-1/2 z-[2500] rounded-xl border px-4 py-2.5 text-xs font-semibold shadow-2xl backdrop-blur-md max-w-[90vw] ${
             cardActionToast.kind === 'ok'
               ? 'border-emerald-500/30 bg-emerald-950/90 text-emerald-300'
               : 'border-rose-500/30 bg-rose-950/90 text-rose-300'
@@ -1919,7 +1919,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
       {/* 1. Environment Variables Modal (variableUpsert / variableDelete) */}
       {selectedEnvService && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in overflow-y-auto">
           <div className="w-[94vw] max-w-xl rounded-3xl border border-neutral-800 bg-neutral-900 p-5 shadow-2xl overflow-y-auto max-h-[90vh]">
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
               <div className="flex items-center gap-2">
@@ -2007,7 +2007,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
       {/* 2. Domain Management Modal (serviceDomainCreate / customDomainCreate) */}
       {selectedDomainService && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in overflow-y-auto">
           <div className="w-[94vw] max-w-lg rounded-3xl border border-neutral-800 bg-neutral-900 p-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
               <div className="flex items-center gap-2">
@@ -2155,7 +2155,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
       {/* 3. Build & Run Config Modal (serviceInstanceUpdate) */}
       {selectedBuildConfigService && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in overflow-y-auto">
           <div className="w-[94vw] max-w-lg rounded-3xl border border-neutral-800 bg-neutral-900 p-5 shadow-2xl overflow-y-auto max-h-[90vh]">
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
               <div className="flex items-center gap-2">
@@ -2258,7 +2258,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
       {/* 4. Persistent Volume Modal (volumeCreate) */}
       {selectedVolumeService && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in overflow-y-auto">
           <div className="w-[92vw] max-w-md rounded-3xl border border-neutral-800 bg-neutral-900 p-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
               <div className="flex items-center gap-2">
@@ -2312,7 +2312,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
       {/* 4b. Manual source update — upload new code into an existing service */}
       {sourceUpdateService && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in overflow-y-auto">
           <div className="w-[96vw] max-w-lg rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-5 shadow-2xl max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between gap-2 border-b border-neutral-800 pb-3 mb-3">
               <div className="flex items-center gap-2 min-w-0">
@@ -2486,7 +2486,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
       {/* 5. Deploy Logs Modal (deploymentLogs) */}
       {selectedLogService && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in overflow-y-auto">
           <div className="w-[94vw] max-w-3xl rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-5 shadow-2xl flex flex-col max-h-[85vh]">
             <div className="flex items-center justify-between gap-2 border-b border-neutral-800 pb-3 mb-3">
               <div className="flex items-center gap-2 min-w-0">
@@ -2567,7 +2567,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
       {/* 7. Project Volumes Modal (project.volumes + volumeDelete) */}
       {volumeProject && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in overflow-y-auto">
           <div className="w-[92vw] max-w-lg rounded-3xl border border-neutral-800 bg-neutral-900 p-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-3">
               <div className="flex items-center gap-2 min-w-0">
@@ -2729,7 +2729,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
 
       {/* New Project Modal */}
       {isNewProjectModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in">
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md animate-in fade-in overflow-y-auto">
           <div className="w-[92vw] max-w-md rounded-3xl border border-neutral-800 bg-neutral-900 p-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
               <div className="flex items-center gap-2">

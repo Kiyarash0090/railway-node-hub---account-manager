@@ -29,6 +29,8 @@ import {
   isSensitiveFile,
   readSourceSelection,
   SourceEntry,
+  findAndParseDockerfile,
+  type DockerfileConfig,
 } from '../utils/sourceFiles';
 import {
   deployGitHubRepoRailway,
@@ -41,6 +43,7 @@ import {
   createRailwaySubdomain,
   uploadRailwaySource,
   upsertRailwayVariable,
+  updateRailwayServiceInstance,
 } from '../services/railwayApi';
 
 interface DeployModalProps {
@@ -86,6 +89,12 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
   const [serviceName, setServiceName] = useState<string>('my-app-node');
   const [port, setPort] = useState<number>(3000);
   const [envVarsText, setEnvVarsText] = useState<string>('PORT=3000\nNODE_ENV=production');
+  // Build/Run config (for CLI/Source deployments)
+  const [builder, setBuilder] = useState<string>('NIXPACKS');
+  const [buildCommand, setBuildCommand] = useState<string>('');
+  const [startCommand, setStartCommand] = useState<string>('');
+  const [rootDirectory, setRootDirectory] = useState<string>('');
+  const [healthcheckPath, setHealthcheckPath] = useState<string>('/');
 
   // CLI / Source Upload Tab — the archive is built in the browser and posted
   // to Railway's /up endpoint, so no GitHub repo is involved.
@@ -100,6 +109,9 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
     fileName: null,
   });
   const [envFromFileEnabled, setEnvFromFileEnabled] = useState(true);
+  // Dockerfile configuration detected from source
+  const [dockerfileConfig, setDockerfileConfig] = useState<DockerfileConfig | null>(null);
+  const [dockerfileApplied, setDockerfileApplied] = useState(false);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const zipInputRef = useRef<HTMLInputElement>(null);
   /** When the current deploy attempt began — the card uses it to ignore an
@@ -399,6 +411,8 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
   ) => {
     setSourceError(null);
     setIsReadingSource(true);
+    setDockerfileConfig(null);
+    setDockerfileApplied(false);
     try {
       const raw = await readSourceSelection({ kind, files, zip });
       const entries = stripCommonRoot(raw);
@@ -414,6 +428,17 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
       if (detected.fileName && Object.keys(detected.vars).length > 0) {
         setEnvFromFileEnabled(true);
         mergeDetectedEnv(detected.vars);
+      }
+
+      // Parse Dockerfile if present to extract build/start commands, root directory, healthcheck
+      const dockerConfig = findAndParseDockerfile(entries);
+      if (dockerConfig) {
+        setDockerfileConfig(dockerConfig);
+        // Auto-apply the detected config to form fields
+        if (dockerConfig.startCommand) setStartCommand(dockerConfig.startCommand);
+        if (dockerConfig.rootDirectory) setRootDirectory(dockerConfig.rootDirectory);
+        if (dockerConfig.healthcheckPath) setHealthcheckPath(dockerConfig.healthcheckPath);
+        setDockerfileApplied(true);
       }
     } catch (err: any) {
       setSourceEntries(null);
@@ -650,7 +675,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
             port: chosenPort,
             serviceName: chosenServiceName,
             envVars,
-            onServiceCreated: ({ serviceId, projectId, environmentId }) => {
+            onServiceCreated: async ({ serviceId, projectId, environmentId }) => {
               // Show the card now, with the build running, instead of waiting
               // for the whole flow to end.
               void deployService(chosenAccount.id, projectId, {
@@ -668,6 +693,30 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
                 startedAt: deployStartedAt.current ?? Date.now(),
                 stageTimestamps: { init: Date.now() },
               });
+
+              // Apply build/run config from Dockerfile or manual input
+              const instanceUpdates: {
+                buildCommand?: string;
+                startCommand?: string;
+                rootDirectory?: string;
+                healthcheckPath?: string;
+                builder?: string;
+              } = {};
+              if (builder) instanceUpdates.builder = builder;
+              if (buildCommand) instanceUpdates.buildCommand = buildCommand;
+              if (startCommand) instanceUpdates.startCommand = startCommand;
+              if (rootDirectory) instanceUpdates.rootDirectory = rootDirectory;
+              if (healthcheckPath) instanceUpdates.healthcheckPath = healthcheckPath;
+
+              if (Object.keys(instanceUpdates).length > 0) {
+                reportPhase('اعمال تنظیمات بیلد/اجرا روی سرویس...', { serviceId });
+                await updateRailwayServiceInstance({
+                  token: chosenAccount.token,
+                  serviceId,
+                  environmentId,
+                  ...instanceUpdates,
+                });
+              }
               void environmentId;
             },
           });
@@ -886,11 +935,17 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-md modal-backdrop-anim">
-      <div className="w-[96vw] max-w-3xl rounded-3xl border border-neutral-800 bg-neutral-900 p-4 sm:p-6 shadow-2xl overflow-y-auto max-h-[92vh] modal-content-anim">
+    <div
+      className="fixed inset-0 z-[2000] flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-md modal-backdrop-anim"
+      onClick={onClose}
+    >
+      <div
+        className="w-[96vw] max-w-3xl rounded-3xl border border-neutral-800 bg-neutral-900 shadow-2xl overflow-hidden max-h-[88vh] max-h-[88dvh] modal-content-anim flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
 
-        {/* Modal Header */}
-        <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
+        {/* Pinned Modal Header */}
+        <div className="flex items-center justify-between px-4 sm:px-6 py-3.5 sm:py-4 bg-neutral-900 border-b border-neutral-800 shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-600 text-white shadow-lg shadow-purple-600/30 ring-1 ring-purple-400/30 shrink-0">
               <Zap className="h-5 w-5" />
@@ -911,7 +966,9 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
           </button>
         </div>
 
-        {/* Success Screen */}
+        {/* Scrollable Modal Body */}
+        <div className="p-4 sm:p-6 overflow-y-auto space-y-4 flex-1 custom-scrollbar">
+          {/* Success Screen */}
         {deploySuccess ? (
           <div className="py-12 text-center space-y-3">
             <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400 ring-4 ring-emerald-500/10">
@@ -1385,6 +1442,69 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
                   </div>
                 )}
 
+                {/* Dockerfile Configuration Display */}
+                {dockerfileConfig && (
+                  <div className="rounded-xl border border-sky-500/30 bg-sky-500/5 p-2.5 space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="flex items-center gap-1.5 text-[11px] font-bold text-sky-300">
+                        <FileCode2 className="h-3.5 w-3.5" />
+                        <span>تنظیمات از Dockerfile استخراج شد</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // Re-apply dockerfile config to form fields
+                          if (dockerfileConfig.startCommand) setStartCommand(dockerfileConfig.startCommand);
+                          if (dockerfileConfig.rootDirectory) setRootDirectory(dockerfileConfig.rootDirectory);
+                          if (dockerfileConfig.healthcheckPath) setHealthcheckPath(dockerfileConfig.healthcheckPath);
+                          setDockerfileApplied(true);
+                        }}
+                        className={`rounded-md px-2 py-0.5 text-[10px] font-semibold border transition ${
+                          dockerfileApplied
+                            ? 'border-sky-500/40 bg-sky-500/20 text-sky-200'
+                            : 'border-neutral-700 bg-neutral-800 text-neutral-400'
+                        }`}
+                      >
+                        {dockerfileApplied ? 'اعمال شده' : 'اعمال کن'}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-[10px]">
+                      {dockerfileConfig.startCommand && (
+                        <div className="rounded-md bg-neutral-900 border border-neutral-800 p-1.5">
+                          <div className="text-neutral-500">دستور اجرا (Start Command)</div>
+                          <div className="font-mono text-sky-300 truncate" dir="ltr" title={dockerfileConfig.startCommand}>
+                            {dockerfileConfig.startCommand}
+                          </div>
+                        </div>
+                      )}
+                      {dockerfileConfig.rootDirectory && (
+                        <div className="rounded-md bg-neutral-900 border border-neutral-800 p-1.5">
+                          <div className="text-neutral-500">Root Directory</div>
+                          <div className="font-mono text-sky-300 truncate" dir="ltr" title={dockerfileConfig.rootDirectory}>
+                            {dockerfileConfig.rootDirectory}
+                          </div>
+                        </div>
+                      )}
+                      {dockerfileConfig.healthcheckPath && (
+                        <div className="rounded-md bg-neutral-900 border border-neutral-800 p-1.5">
+                          <div className="text-neutral-500">Healthcheck Path</div>
+                          <div className="font-mono text-sky-300 truncate" dir="ltr" title={dockerfileConfig.healthcheckPath}>
+                            {dockerfileConfig.healthcheckPath}
+                          </div>
+                        </div>
+                      )}
+                      {dockerfileConfig.buildCommand && (
+                        <div className="rounded-md bg-neutral-900 border border-neutral-800 p-1.5">
+                          <div className="text-neutral-500">دستور بیلد (Build Command)</div>
+                          <div className="font-mono text-sky-300 truncate" dir="ltr" title={dockerfileConfig.buildCommand}>
+                            {dockerfileConfig.buildCommand}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 <details className="rounded-xl bg-neutral-900/60 border border-neutral-800 px-2.5 py-2">
                   <summary className="cursor-pointer text-[10px] text-neutral-500 hover:text-neutral-300">
                     یا با CLI خودتان آپلود کنید (railway up)
@@ -1477,6 +1597,80 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
               />
             </div>
 
+            {/* Build & Run Configuration (applied after source upload / service creation) */}
+            <details className="rounded-xl border border-neutral-800 bg-neutral-950/60 p-3">
+              <summary className="flex items-center gap-2 cursor-pointer text-sm font-semibold text-white hover:text-purple-300">
+                <FileCode2 className="h-4 w-4 text-purple-400" />
+                <span>تنظیمات بیلد و اجرا (Build & Run Config)</span>
+                <span className="ml-auto text-[10px] text-neutral-500">اختیاری — برای سرویس‌های source-upload / CLI</span>
+              </summary>
+              <div className="mt-3 space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-neutral-300 font-medium mb-1">Builder</label>
+                    <select
+                      value={builder}
+                      onChange={(e) => setBuilder(e.target.value)}
+                      className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-white font-mono focus:border-purple-500 focus:outline-none"
+                    >
+                      <option value="NIXPACKS">NIXPACKS (پیش‌فرض)</option>
+                      <option value="DOCKERFILE">DOCKERFILE</option>
+                      <option value="HEROKU">HEROKU BUILDPACKS</option>
+                      <option value="PAKETO">PAKETO</option>
+                      <option value="RAILPACK">RAILPACK</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-neutral-300 font-medium mb-1">دستور بیلد (Build Command)</label>
+                    <input
+                      type="text"
+                      value={buildCommand}
+                      onChange={(e) => setBuildCommand(e.target.value)}
+                      placeholder="npm run build"
+                      className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-white focus:border-purple-500 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-neutral-300 font-medium mb-1">دستور اجرا (Start Command)</label>
+                    <input
+                      type="text"
+                      value={startCommand}
+                      onChange={(e) => setStartCommand(e.target.value)}
+                      placeholder="npm start"
+                      className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-white focus:border-purple-500 focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-neutral-300 font-medium mb-1">Root Directory (Monorepo)</label>
+                    <input
+                      type="text"
+                      value={rootDirectory}
+                      onChange={(e) => setRootDirectory(e.target.value)}
+                      placeholder="apps/web"
+                      className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-white focus:border-purple-500 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-neutral-300 font-medium mb-1">مسیر Healthcheck</label>
+                    <input
+                      type="text"
+                      value={healthcheckPath}
+                      onChange={(e) => setHealthcheckPath(e.target.value)}
+                      placeholder="/health"
+                      className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-white focus:border-purple-500 focus:outline-none"
+                    />
+                  </div>
+                </div>
+              </div>
+            </details>
+
             {deployPhase && isDeploying && (
               <div className="flex items-center gap-2 rounded-xl bg-sky-500/10 border border-sky-500/30 p-3 text-xs text-sky-300">
                 <RotateCw className="h-4 w-4 shrink-0 animate-spin" />
@@ -1522,6 +1716,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
           </form>
         )}
 
+        </div>
       </div>
     </div>
   );

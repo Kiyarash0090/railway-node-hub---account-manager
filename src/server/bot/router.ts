@@ -27,6 +27,7 @@ import {
 import { splitMessage, truncate } from './format';
 import { extractTarGz } from './tar';
 import { zipToTarGz } from './archive';
+import { parseDockerfile } from '../../utils/sourceFiles';
 import {
   apiPost,
   getAccounts,
@@ -1377,8 +1378,11 @@ async function handleAwaiting(
       }
 
       let envFromArchive: Record<string, string> = {};
+      let dockerfileConfig: ReturnType<typeof parseDockerfile> | null = null;
       try {
         envFromArchive = readEnvFromArchive(archive);
+        // Parse Dockerfile if present
+        dockerfileConfig = parseDockerfileFromArchive(archive);
       } catch {
         // Best effort only — a malformed archive must not block the deploy.
       }
@@ -1386,6 +1390,27 @@ async function handleAwaiting(
       const projectId = payload.projectId || targetProject(chatId, accountId, {}) || (await placeholderProject(accountId));
       const result = await deploySourceUpload(accountId, projectId, archive, undefined);
       if (!result.ok) return send(`❌ دیپلوی ناموفق: ${result.error}`);
+
+      // Apply Dockerfile config to the new service if found
+      if (result.serviceId && dockerfileConfig) {
+        const ref = {
+          accountId,
+          projectId,
+          serviceId: result.serviceId,
+          environmentId: findProject(accountId, projectId)?.defaultEnvironmentId,
+        };
+        const updates: Record<string, string> = {};
+        if (dockerfileConfig.startCommand) updates.startCommand = dockerfileConfig.startCommand;
+        if (dockerfileConfig.rootDirectory) updates.rootDirectory = dockerfileConfig.rootDirectory;
+        if (dockerfileConfig.healthcheckPath) updates.healthcheckPath = dockerfileConfig.healthcheckPath;
+        if (dockerfileConfig.buildCommand) updates.buildCommand = dockerfileConfig.buildCommand;
+
+        if (Object.keys(updates).length > 0) {
+          await updateServiceSettings(ref, updates).catch(() => {});
+          await send(`🐳 تنظیمات از Dockerfile استخراج و اعمال شد:\n` +
+            Object.entries(updates).map(([k, v]) => `• ${k}: ${v}`).join('\n'));
+        }
+      }
 
       if (result.serviceId && Object.keys(envFromArchive).length > 0) {
         const ref = {
@@ -1475,6 +1500,20 @@ async function handleAwaiting(
     default:
       return send('ورودی غیرمنتظره؛ از منو ادامه دهید.');
   }
+}
+
+/** Parses Dockerfile from a source archive. */
+function parseDockerfileFromArchive(archive: Buffer): ReturnType<typeof parseDockerfile> | null {
+  const entries = extractTarGz(archive);
+  const dockerfileEntry = entries.find(e =>
+    e.data &&
+    (e.name.toLowerCase() === 'dockerfile' ||
+     e.name.toLowerCase().endsWith('/dockerfile') ||
+     e.name.toLowerCase().match(/dockerfile\.[a-z]+$/i))
+  );
+  if (!dockerfileEntry || !dockerfileEntry.data) return null;
+  const content = dockerfileEntry.data.toString('utf8');
+  return parseDockerfile(content);
 }
 
 /** Build a minimal .env map from files inside a source archive. */
