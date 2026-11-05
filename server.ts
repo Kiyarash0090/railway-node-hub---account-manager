@@ -3013,7 +3013,7 @@ async function startServer() {
   // 5. Service Instance Build/Run Update Proxy
   app.post('/api/railway/service/instance-update', async (req, res) => {
     try {
-      const { token, serviceId, environmentId = 'production', buildCommand, startCommand, builder, rootDirectory, healthcheckPath, region } = req.body;
+      const { token, serviceId, environmentId, buildCommand, startCommand, builder, rootDirectory, healthcheckPath, region } = req.body;
       if (!token || !serviceId) return res.status(400).json({ error: 'token and serviceId are required' });
 
       const query = `
@@ -3040,7 +3040,7 @@ async function startServer() {
           query,
           variables: {
             serviceId,
-            environmentId,
+            ...(environmentId ? { environmentId } : {}),
             input,
           },
         }),

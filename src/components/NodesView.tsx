@@ -1054,6 +1054,7 @@ export const NodesView: React.FC<NodesViewProps> = ({ onOpenDeploy }) => {
     await updateRailwayServiceInstance({
       token: targetAccount.token,
       serviceId: selectedBuildConfigService.id,
+      environmentId: resolveServiceEnvId(selectedBuildConfigService) || undefined,
       builder,
       buildCommand,
       startCommand,

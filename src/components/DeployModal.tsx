@@ -295,6 +295,12 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
           }
           return true;
         });
+      // Newest deployment first: without this, an old failed deployment can be
+      // returned as "latest" and mask the result of a fresh redeploy (the user
+      // keeps seeing the previous error instead of the new one).
+      candidates.sort(
+        (a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime(),
+      );
       const latest = candidates[0];
       if (latest?.status && latest.status !== lastStatus) {
         lastStatus = latest.status;
